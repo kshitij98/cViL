@@ -1,0 +1,2 @@
+2021-08-30 21:56:31,216 vlpretrain WARNING: Device: cuda, n_gpu: 4
+2021-08-30 21:56:31,217 vlpretrain INFO: output_mode: classification, #Labels: 2

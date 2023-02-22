@@ -12,11 +12,13 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+NUM_LABELS = int(os.environ['NUM_LABELS'])
+
 
 class InputInstance(object):
     """A single training/test example for simple sequence classification."""
 
-    def __init__(self, guid, text_a, text_b=None, label=None, score=None, img_key=None, q_id=None):
+    def __init__(self, guid, text_a, text_b=None, label=None, score=None, img_key=None, q_id=None, word_align=None):
         """Constructs a InputExample.
 
         Args:
@@ -36,6 +38,7 @@ class InputInstance(object):
         self.score = score
         self.img_key = img_key
         self.q_id = q_id
+        self.word_align = word_align
 
 
 class InputFeat(object):
@@ -113,18 +116,33 @@ class VQATextProcessor(DataProcessor):
     def _create_examples(self, lines, set_type):
         """Creates examples for the training and dev sets."""
 
+        langs = ['hi', 'en', 'ja']
+
         examples = []
         for (i, line) in enumerate(lines):
             if set_type!='test' and len(line['an']) == 0: continue
 
+
             guid = "%s-%s" % (set_type, str(i))
-            text_a = line['q']
+
+            langs = ['en', 'hi', 'ja']
+            text_a = {}
+            for lang in langs:
+                if lang in line:
+                    text_a[lang] = line[lang]
             text_b = line['o'].replace(';', ' ').strip() #line['o']
             label = None if set_type.startswith('test') else line['an']
             score = None if set_type.startswith('test') else line['s']
             img_key = line['img_id']
             q_id = int(line['q_id']) if set_type.startswith('test') else 0
-            examples.append(InputInstance(guid=guid, text_a=text_a, text_b=text_b, label=label, score=score, img_key=img_key, q_id=q_id))
+            word_align = {}
+            for lang in langs:
+                if lang == 'en':
+                    continue
+                word_align[lang] = line[f'{lang}-en'] if f'{lang}-en' in line else None
+            # english = None if 'english' not in line.keys() else line['english']
+            # examples.append(InputInstance(guid=guid, text_a=text_a, text_b=text_b, label=label, score=score, img_key=img_key, q_id=q_id, english=english))
+            examples.append(InputInstance(guid=guid, text_a=text_a, text_b=text_b, label=label, score=score, img_key=img_key, q_id=q_id, word_align=word_align))
         return examples
 
 class VQATextAProcessor(DataProcessor):
@@ -166,13 +184,27 @@ class VQATextAProcessor(DataProcessor):
             if set_type!='test' and len(line['an']) == 0: continue
 
             guid = "%s-%s" % (set_type, str(i))
-            text_a = line['q']
+
+            langs = ['en', 'hi', 'ja']
+            text_a = {}
+            for lang in langs:
+                if lang in line:
+                    text_a[lang] = line[lang]
+
+            # text_a = line['q']
             text_b = None # line['o'] # or None
             label = None if set_type.startswith('test') else line['an']
             score = None if set_type.startswith('test') else line['s']
             img_key = line['img_id']
             q_id = int(line['q_id']) if set_type.startswith('test') else 0
-            examples.append(InputInstance(guid=guid, text_a=text_a, text_b=text_b, label=label, score=score, img_key=img_key, q_id=q_id))
+            word_align = {}
+            for lang in langs:
+                if lang == 'en':
+                    continue
+                word_align[lang] = line[f'{lang}-en'] if f'{lang}-en' in line else None
+            # english = None if 'english' not in line.keys() else line['english']
+            # examples.append(InputInstance(guid=guid, text_a=text_a, text_b=text_b, label=label, score=score, img_key=img_key, q_id=q_id, english=english))
+            examples.append(InputInstance(guid=guid, text_a=text_a, text_b=text_b, label=label, score=score, img_key=img_key, q_id=q_id, word_align=word_align))
         return examples
 
 class GQAProcessor(DataProcessor):
@@ -214,12 +246,19 @@ class GQAProcessor(DataProcessor):
             if set_type!='test' and len(line['an']) == 0: continue
 
             guid = "%s-%s" % (set_type, str(i))
-            text_a = line['q']
+            langs = ['en', 'hi', 'ja']
+            text_a = {}
+            for lang in langs:
+                if lang in line:
+                    text_a[lang] = line[lang]
+            # text_a = line['q']
             text_b = line['o'] # or None
             label = None if set_type.startswith('test') else line['an']
             score = 0
             img_key = line['img_id']
             q_id = int(line['q_id']) if set_type.startswith('test') else 0
+            # english = None if 'english' not in line.keys() else line['english']
+            # examples.append(InputInstance(guid=guid, text_a=text_a, text_b=text_b, label=label, score=score, img_key=img_key, q_id=q_id, english=english))
             examples.append(InputInstance(guid=guid, text_a=text_a, text_b=text_b, label=label, score=score, img_key=img_key, q_id=q_id))
         return examples
 
@@ -261,12 +300,19 @@ class NLVRProcessor(DataProcessor):
         examples = []
         for (i, line) in enumerate(lines):
             guid = "%s-%s" % (set_type, str(i))
-            text_a = line['q']
+            langs = ['en', 'hi', 'ja']
+            text_a = {}
+            for lang in langs:
+                if lang in line:
+                    text_a[lang] = line[lang]
+            # text_a = line['q']
             text_b = line['o'] if use_label_seq else None
             label = line['label'] #None if set_type.startswith('test') else line['label']
             score = 0
             img_key = line['img_id'] #[line['img_left'], line['img_left']]
             q_id = 0 #int(line['q_id']) if set_type.startswith('test') else 0
+            # english = None if 'english' not in line.keys() else line['english']
+            # examples.append(InputInstance(guid=guid, text_a=text_a, text_b=text_b, label=label, score=score, img_key=img_key, q_id=q_id, english=english))
             examples.append(InputInstance(guid=guid, text_a=text_a, text_b=text_b, label=label, score=score, img_key=img_key, q_id=q_id))
         return examples
 
@@ -306,12 +352,19 @@ class VCR_Q_A_Processor(DataProcessor):
             #if set_type!='test': continue
 
             guid = "%s-%s" % (set_type, str(i))
-            text_a = line['q'] # question
+            langs = ['en', 'hi', 'ja']
+            text_a = {}
+            for lang in langs:
+                if lang in line:
+                    text_a[lang] = line[lang]
+            # text_a = line['q']
             choices = line['choices']
             label = None if set_type.startswith('test') else line['label']
             img_key = line['img_id']
             q_id = int(line['annot_id'].split('-')[-1]) #int(line['q_id']) if set_type.startswith('test') else 0
             score = line['objects'] if 'objects' in line else None
+            # english = None if 'english' not in line.keys() else line['english']
+            # examples.append(InputInstance(guid=guid, text_a=text_a, text_b=choices, label=label, score=score, img_key=img_key, q_id=q_id, english=english))
             examples.append(InputInstance(guid=guid, text_a=text_a, text_b=choices, label=label, score=score, img_key=img_key, q_id=q_id))
         return examples
 
@@ -351,11 +404,15 @@ class VCR_QA_R_Processor(DataProcessor):
             #if set_type!='test': continue
 
             guid = "%s-%s" % (set_type, str(i))
+            
+            # Possible bug!! no q found!!
             text_a = line['q'] + ' ' + line['choices'][line['label']] # question_choice
             choices = line['rational_choices'] # rational_choice
             label = None if set_type.startswith('test') else line['rational_label'] # rational_label
             img_key = line['img_id']
             q_id = int(line['annot_id'].split('-')[-1]) #int(line['q_id']) if set_type.startswith('test') else 0
+            # english = None if 'english' not in line.keys() else line['english']
+            # examples.append(InputInstance(guid=guid, text_a=text_a, text_b=choices, label=label, score=None, img_key=img_key, q_id=q_id, english=english))
             examples.append(InputInstance(guid=guid, text_a=text_a, text_b=choices, label=label, score=None, img_key=img_key, q_id=q_id))
         return examples
 
@@ -395,12 +452,21 @@ class VCR_QAR_Processor(DataProcessor):
             #if set_type!='test': continue
 
             guid = "%s-%s-q-a" % (set_type, str(i))
-            text_a = line['q'] # question
+            langs = ['en', 'hi', 'ja']
+            text_a = {}
+            for lang in langs:
+                if lang in line:
+                    text_a[lang] = line[lang]
+
+            # text_a = line['q']
+            # text_a = line['q'] # question
             choices = line['choices']
             label = None if set_type.startswith('test') else line['label']
             img_key = line['img_id']
             q_id = int(line['annot_id'].split('-')[-1]) #int(line['q_id']) if set_type.startswith('test') else 0
             score = line['objects'] if 'objects' in line else None
+            # english = None if 'english' not in line.keys() else line['english']
+            # examples.append(InputInstance(guid=guid, text_a=text_a, text_b=choices, label=label, score=score, img_key=img_key, q_id=q_id, english=english))
             examples.append(InputInstance(guid=guid, text_a=text_a, text_b=choices, label=label, score=score, img_key=img_key, q_id=q_id))
 
             if set_type == 'train': # qa -> r
@@ -411,6 +477,8 @@ class VCR_QAR_Processor(DataProcessor):
                 img_key = line['img_id']
                 q_id = int(line['annot_id'].split('-')[-1]) # int(line['q_id']) if set_type.startswith('test') else 0
                 score = line['objects'] if 'objects' in line else None
+                # english = None if 'english' not in line.keys() else line['english']
+                # examples.append(InputInstance(guid=guid, text_a=text_a, text_b=choices, label=label, score=score, img_key=img_key, q_id=q_id, english=english))
                 examples.append(InputInstance(guid=guid, text_a=text_a, text_b=choices, label=label, score=score, img_key=img_key, q_id=q_id))
         return examples
 
@@ -533,6 +601,8 @@ def convert_examples_to_features_vqa(examples, img_feats, label_list, max_img_se
         else:
             raise KeyError(output_mode)
 
+        # english = example.english
+
         if ex_index < 5:
             logger.info("*** Example ***")
             logger.info("guid: %s" % (example.guid))
@@ -543,6 +613,7 @@ def convert_examples_to_features_vqa(examples, img_feats, label_list, max_img_se
             logger.info("label: %s (id = %s)" % (example.label, label_id))
             logger.info("score: %s (score = %s)" % (example.score, score))
 
+        # features.append(InputFeat(input_ids=input_ids, input_mask=input_mask, segment_ids=segment_ids, label_id=label_id, score=score, img_feat=img_feat, english=example.english))
         features.append(InputFeat(input_ids=input_ids, input_mask=input_mask, segment_ids=segment_ids, label_id=label_id, score=score, img_feat=img_feat))
     return features
 
@@ -585,8 +656,8 @@ output_modes = {
 }
 
 GLUE_TASKS_NUM_LABELS = {
-    "vqa_text": 3129,
-    "vqa_text_a": 3129,
+    "vqa_text": NUM_LABELS,
+    "vqa_text_a": NUM_LABELS,
     "gqa": 1853,
     "nlvr": 2,
     "vcr_q_a": 2,

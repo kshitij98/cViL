@@ -38,6 +38,18 @@ log_json = []
 debug_size = 500
 
 
+class ImageFeatureLoader:
+    def __init__(self, dir_name, file_format):
+        self.dir_name = dir_name
+        self.file_format = file_format
+
+    def __getitem__(self, key):
+        name = f'{self.dir_name}/{key}.{self.file_format}'
+        return torch.load(name)
+
+    def __len__(self):
+        return len(os.listdir(self.dir_name))
+
 def _load_dataset(args, name):
     processor = processors[args.task_name]()
     labels = processor.get_labels(args.label_file)
@@ -46,35 +58,35 @@ def _load_dataset(args, name):
         if args.data_label_type == 'mask':
             if args.use_vg:
                 #examples = processor.get_train_examples(args.data_dir, 'train2014_vg_qla_mrcnn.json')
-                examples = processor.get_train_examples(args.txt_data_dir, 'train2014_vg_qla_mrcnn.json')
+                examples = processor.get_train_examples(args.txt_data_dir, 'train2014_vg_qla_mrcnn_parallel.json')
             else:
-                examples = processor.get_train_examples(args.txt_data_dir, 'train2014_qla_mrcnn.json')
+                examples = processor.get_train_examples(args.txt_data_dir, 'train2014_qla_mrcnn_parallel.json')
         else:
-            examples = processor.get_train_examples(args.txt_data_dir, 'train2014_qla.json')
+            examples = processor.get_train_examples(args.txt_data_dir, 'train2014_qla_parallel.json')
     elif name == 'val':
         if args.data_label_type == 'mask':
             if args.use_vg_dev:
-                examples = processor.get_dev_examples(args.txt_data_dir, 'vg_qla_mrcnn.json')
+                examples = processor.get_dev_examples(args.txt_data_dir, 'vg_qla_mrcnn_parallel.json')
             else:
-                examples = processor.get_dev_examples(args.txt_data_dir, 'val2014_qla_mrcnn.json')
+                examples = processor.get_dev_examples(args.txt_data_dir, 'val2014_qla_mrcnn_parallel.json')
         else:
-            examples = processor.get_dev_examples(args.txt_data_dir, 'val2014_qla.json')
+            examples = processor.get_dev_examples(args.txt_data_dir, 'val2014_qla_parallel.json')
     elif name == 'train+val':
         if args.data_label_type == 'mask':
-            examples = processor.get_train_examples(args.txt_data_dir, 'train+val2014_qla_mrcnn.json')
-            #examples = processor.get_train_examples(args.data_dir, 'train+val2014_qla_mrcnn.json')
+            examples = processor.get_train_examples(args.txt_data_dir, 'train+val2014_qla_mrcnn_parallel.json')
+            #examples = processor.get_train_examples(args.data_dir, 'train+val2014_qla_mrcnn_parallel.json')
         else:
-            examples = processor.get_train_examples(args.txt_data_dir, 'train+val2014_qla.json')
+            examples = processor.get_train_examples(args.txt_data_dir, 'train+val2014_qla_parallel.json')
     elif name == 'test2015':
         if args.data_label_type == 'mask':
-            examples = processor.get_test_examples(args.data_dir, 'test2015_qla_mrcnn.json')
+            examples = processor.get_test_examples(args.data_dir, 'test2015_qla_mrcnn_parallel.json')
         else:
-            examples = processor.get_test_examples(args.data_dir, 'test2014_qla.json')
+            examples = processor.get_test_examples(args.data_dir, 'test2014_qla_parallel.json')
     elif name == 'test-dev2015':
         if args.data_label_type == 'mask':
-            examples = processor.get_test_examples(args.data_dir, 'test-dev2015_qla_mrcnn.json')
+            examples = processor.get_test_examples(args.data_dir, 'test-dev2015_qla_mrcnn_parallel.json')
         else:
-            examples = processor.get_test_examples(args.data_dir, 'test2014_qla.json')
+            examples = processor.get_test_examples(args.data_dir, 'test2014_qla_parallel.json')
 
     return examples, labels
 
@@ -95,7 +107,7 @@ class VQADataset(Dataset):
         self.img_feat_offset_map = None
 
         if args.img_feature_type == 'faster_r-cnn':
-            if args.img_feat_format == 'pt':
+            if args.img_feat_format == 'pt-split':
                 if args.img_feature_dim == 2048: # object features
                     self.img_features = torch.load(os.path.join(args.data_dir, '{}_img_frcnn_obj_feats.pt'.format(name)))
                 else: # object + spatial features
@@ -103,6 +115,14 @@ class VQADataset(Dataset):
                         self.img_features = torch.load(os.path.join(args.data_dir, 'train+val_img_frcnn_feats.pt'))
                     else:
                         self.img_features = torch.load(os.path.join(args.data_dir, '{}_img_frcnn_feats.pt'.format(name)))
+            elif args.img_feat_format == 'pt':
+                if args.img_feature_dim == 2048: # object features
+                    self.img_features = ImageFeatureLoader(os.path.join(args.data_dir, name), 'pt')
+                else: # object + spatial features
+                    if args.use_vg_dev:
+                        self.img_features = ImageFeatureLoader(os.path.join(args.data_dir, 'train+val'), 'pt')
+                    else:
+                        self.img_features = ImageFeatureLoader(os.path.join(args.data_dir, name), 'pt')
             elif args.img_feat_format == 'tsv':
                 self.load_img_tsv_features()
         elif args.img_feature_type == 'mask_r-cnn':
@@ -558,7 +578,11 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
                       'attention_mask': batch[1],
                       'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,  # XLM don't use segment_ids
                       'labels':         batch[4],
-                      'img_feats':      None if args.img_feature_dim == -1 else batch[5]}
+                      'img_feats':      None if args.img_feature_dim == -1 else batch[5],
+                      'hindi':          batch[6]}
+
+            print(inputs['hindi'])
+
             outputs = model(**inputs)
 
             #loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
@@ -719,7 +743,8 @@ def evaluate(args, model, eval_dataset=None, prefix=""):
                           'attention_mask': batch[1],
                           'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,  # XLM don't use segment_ids
                           'labels':         batch[4],
-                          'img_feats':      None if args.img_feature_dim == -1 else batch[5]}
+                          'img_feats':      None if args.img_feature_dim == -1 else batch[5],
+                          'hindi':          batch[6]}
                 outputs = model(**inputs)
                 tmp_eval_loss, logits = outputs[:2]
 

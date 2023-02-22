@@ -8,6 +8,10 @@ import logging
 import os
 import copy, time, json
 import base64
+from types import prepare_class
+from tqdm import tqdm
+import threading
+import cProfile
 
 import sys
 sys.path.insert(0, '.')
@@ -27,8 +31,15 @@ from oscar.utils.misc import set_seed
 from oscar.utils.task_utils import (_truncate_seq_pair, convert_examples_to_features_vqa,
                         output_modes, processors)
 
+from nltk.tokenize import word_tokenize
+import nltk
+nltk.download('punkt')
+import random
+
+
 logger = logging.getLogger(__name__)
 
+SECOND_STEP = False
 MODEL_CLASSES = {
     'bert': (BertConfig, ImageBertForSequenceClassification, BertTokenizer),
 }
@@ -37,6 +48,144 @@ MODEL_CLASSES = {
 log_json = []
 debug_size = 500
 
+# Shuffling teacher model features to 
+def get_align(teacher, student, codemix_align, no_images=False, no_tags=False, no_cls=False):
+    total_tokens = 128 + 50
+
+    # print(word_align)
+
+    # print(teacher)
+    # print(student)
+
+    loss_align, loss_bools = codemix_align
+
+    # TODO: Apply loss on code-mixed student!!
+    # print(codemix_align[0].shape, codemix_align[1].shape)
+
+    # MANUAL : Fix if need to update size!
+    if loss_align is not None:
+        apply_loss = torch.zeros(total_tokens, dtype=torch.bool, device=loss_align.device)
+    else:
+        apply_loss = torch.zeros(total_tokens, dtype=torch.bool)
+
+    if not no_cls:
+        apply_loss[0] = 1
+
+    if not no_images:
+        apply_loss[-50:] = 1
+
+    if loss_bools is not None:
+        apply_loss[loss_bools] = True
+
+        align = torch.zeros(total_tokens, dtype=torch.int16, device=loss_align.device)
+    else:
+        align = torch.zeros(total_tokens, dtype=torch.int16)
+
+    if not no_images:
+        align[-50:] = torch.tensor(list(range(total_tokens - 50, total_tokens)), dtype=torch.int16)
+
+    if loss_bools is not None:
+        align[loss_bools] = loss_align[loss_bools]
+
+    if not no_tags:
+        # Applying loss on overlapping object tags
+        t_i = teacher.index('[SEP]')
+        s_i = student.index('[SEP]')
+
+        # print(student[0], teacher[0])
+
+        s_len = min(128, len(student))
+        t_len = min(128, len(teacher))
+
+        # print('>', loss_align[:20])
+
+        align[s_i] = t_i
+        apply_loss[s_i] = True
+
+        s_i += 1
+        t_i += 1
+        while s_i < s_len and t_i < t_len:
+            if teacher[t_i] == student[s_i]:
+                apply_loss[s_i] = True
+                align[s_i] = t_i
+            word_len = 1
+            temp = 1
+            while s_i + temp < s_len and student[s_i + temp].startswith('##'):
+                word_len += 1
+                if t_i + temp < t_len and teacher[t_i + temp] == student[s_i + temp]:
+                    apply_loss[s_i + temp] = True
+                    align[s_i + temp] = t_i + temp
+                temp += 1
+
+            s_i += word_len
+            t_i += 1
+            while t_i < t_len and teacher[t_i].startswith('##'):
+                t_i += 1
+ 
+    # print(align)
+    # print(apply_loss)
+
+    # for i, x in enumerate(align):
+    #     if i >= 128:
+    #         break
+    #     if x == 0 and i != 0:
+    #         continue
+    #     print((student[i], teacher[x], i, align[i]))
+    # print('-------')
+
+    return align, apply_loss
+
+
+def teacher_load(names, worker_id, workers, device):
+    num = len(names) // workers
+    assert num * workers == len(names)
+
+    start_id = worker_id * num
+    for name_id in range(start_id, start_id + num):
+        names[name_id] = torch.load(names[name_id], map_location=torch.device(device))
+        # names[name_id] = torch.from_numpy(names[name_id]).to(device)
+
+
+class LazyFeatureLoader:
+    def __init__(self, dir_name, file_format, worker_id=None):        
+        self.dir_name = dir_name
+        # if dir_name.endswith('val'):
+        #     dir_name = dir_name.split('/')
+        #     dir_name[-1] = 'test'
+        #     dir_name = '/'.join(dir_name)
+        #     self.dir_name = dir_name
+        self.file_format = file_format
+        self.len = len(os.listdir(self.dir_name))
+        self.worker_id = worker_id
+
+    def __getitem__(self, key):
+        name = f'{self.dir_name}/{key}.{self.file_format}'
+        if self.worker_id is not None:
+            print('> ', self.worker_id, key)
+        return torch.load(name)
+
+    def __len__(self):
+        return self.len
+
+class LazyFeaturePickleLoader:
+    def __init__(self, dir_name, file_format, worker_id=None):
+        self.dir_name = dir_name
+        self.file_format = file_format
+        self.len = len(os.listdir(self.dir_name))
+        self.worker_id = worker_id
+
+    def __getitem__(self, key):
+        return key
+        # name = f'{self.dir_name}/{key}.{self.file_format}'
+        # if self.worker_id is not None:
+        #     print('> ', self.worker_id, key)
+        # return name
+        # with open(name, 'rb') as f:
+            # data = cPickle.load(f)
+        # return data
+
+    def __len__(self):
+        return self.len
 
 def _load_dataset(args, name):
     processor = processors[args.task_name]()
@@ -56,6 +205,7 @@ def _load_dataset(args, name):
             if args.use_vg_dev:
                 examples = processor.get_dev_examples(args.txt_data_dir, 'vg_qla_mrcnn.json')
             else:
+                # examples = processor.get_dev_examples(args.txt_data_dir, 'test.json')
                 examples = processor.get_dev_examples(args.txt_data_dir, 'val2014_qla_mrcnn.json')
         else:
             examples = processor.get_dev_examples(args.txt_data_dir, 'val2014_qla.json')
@@ -76,26 +226,55 @@ def _load_dataset(args, name):
         else:
             examples = processor.get_test_examples(args.data_dir, 'test2014_qla.json')
 
+    # for i, example in tqdm(enumerate(examples)):
+    #     label = example.label
+    #     if example.q_id == 10008099:
+    #         print('-------------------->', example.q_id, example.label)
+    #     if len(label) == 0:
+    #         print(i, label)
+    #     else:
+    #         label = label[0]
+    #         if label < 0 or label > 2999:
+    #             print(label)
+
     return examples, labels
 
 
 class VQADataset(Dataset):
     """ VQA Dataset """
 
-    def __init__(self, args, name, tokenizer):
+    def __init__(self, args, name, tokenizer, teacher_dir=None, teacher_tokenizer=None):
         super(VQADataset, self).__init__()
         assert name in ['train', 'val', 'test-dev2015', 'test2015', 'train+val']
 
         self.args = args
         self.name = name
+        # Load teacher outputs only for training set...
+        self.teacher_features = None
+        if args.do_kd is True and name == 'train':
+            self.teacher_features = LazyFeaturePickleLoader(f'{args.teacher_features_dir}/features', 'pt')
+        # elif name == 'train':
+        #     self.teacher_features = LazyFeaturePickleLoader(args.teacher_features_dir, 'pt')
+
+        self.teacher_tokenizer = teacher_tokenizer
+
+        # self.teacher_model = None
+        # if teacher is not None:
+            # # TODO: Shift teacher model to GPU, currently testing on CPU
+            # self.teacher_data_loader = VQADataset(args, name, teacher[0])
+            # self.teacher_model = teacher[1]
+            # print(f'Shifting teacher model to {device}!')
+            # self.teacher_model.to(device)
 
         # load image features
         t_start = time.time()
         self.img_feature_file = None
         self.img_feat_offset_map = None
 
+        print(f'Loading image features for {name}...')
+
         if args.img_feature_type == 'faster_r-cnn':
-            if args.img_feat_format == 'pt':
+            if args.img_feat_format == 'pt-split':
                 if args.img_feature_dim == 2048: # object features
                     self.img_features = torch.load(os.path.join(args.data_dir, '{}_img_frcnn_obj_feats.pt'.format(name)))
                 else: # object + spatial features
@@ -103,6 +282,14 @@ class VQADataset(Dataset):
                         self.img_features = torch.load(os.path.join(args.data_dir, 'train+val_img_frcnn_feats.pt'))
                     else:
                         self.img_features = torch.load(os.path.join(args.data_dir, '{}_img_frcnn_feats.pt'.format(name)))
+            elif args.img_feat_format == 'pt':
+                if args.img_feature_dim == 2048: # object features
+                    self.img_features = LazyFeatureLoader(os.path.join(args.data_dir, name), 'pt')
+                else: # object + spatial features
+                    if args.use_vg_dev:
+                        self.img_features = LazyFeatureLoader(os.path.join(args.data_dir, 'train+val'), 'pt')
+                    else:
+                        self.img_features = LazyFeatureLoader(os.path.join(args.data_dir, name), 'pt')
             elif args.img_feat_format == 'tsv':
                 self.load_img_tsv_features()
         elif args.img_feature_type == 'mask_r-cnn':
@@ -111,6 +298,7 @@ class VQADataset(Dataset):
             self.img_features = torch.load(os.path.join(args.data_dir, 'vqvae', '{}.pt'.format(name)))['feats_{}'.format(args.code_level)]
         else:
             self.img_features = torch.load(os.path.join(args.data_dir, '{}_img_feats.pt'.format(name)))
+        print('Loaded image features!')
         t_end = time.time()
         logger.info('Info: loading {0} features using {1:.2f} secs'.format(name, (t_end-t_start)))
 
@@ -143,12 +331,14 @@ class VQADataset(Dataset):
         debug_size = 500
         features = []
 
+        print('tensorizee!')
+
         for (ex_index, example) in enumerate(self.examples[0: ]):
             if len(example.label) == 0: continue
             if ex_index % 10000 == 0: logger.info("Tensorizing example %d of %d" % (ex_index, len(self.examples)))
 
-            tokens_a = self.tokenizer.tokenize(example.text_a)
-
+            tokens_a = self.tokenizer.tokenize(example.text_a[self.args.lang])
+            word_align = example.word_align[self.args.lang] if self.args.lang in example.word_align else None
             tokens_b = None
             if example.text_b:
                 tokens_b = self.tokenizer.tokenize(example.text_b)
@@ -173,6 +363,8 @@ class VQADataset(Dataset):
             else:
                 tokens = [cls_token] + tokens
                 segment_ids = [cls_token_segment_id] + segment_ids
+
+            # print(tokens)
 
             input_ids = self.tokenizer.convert_tokens_to_ids(tokens)
 
@@ -240,15 +432,249 @@ class VQADataset(Dataset):
 
         return features
 
+    def same_tokenization(self, word, tokenizers):
+        same = True
+        all_tokens = []
+        for tokenizer in tokenizers:
+            tokens = tokenizer.tokenize(word)
+            all_tokens.append(tokens)
+
+
+        for i in range(1, len(tokenizers)):
+            if len(all_tokens[i]) != len(all_tokens[0]):
+                same = False
+                break
+            for j, token in enumerate(all_tokens[i]):
+                if token != all_tokens[0][j]:
+                    same = False
+        
+        return same
+
+    def get_codemix_align(self, bert_tokens, aligns):
+        # en_word_tokens, ja_word_tokens = word_tokens
+        en_bert_tokens, codemix_bert_tokens = bert_tokens
+
+        # print(codemix_bert_tokens)
+
+        loss_align = torch.zeros((len(codemix_bert_tokens) + 1), dtype=torch.long)
+        loss_bools = torch.zeros((len(codemix_bert_tokens) + 1), dtype=torch.bool)
+
+        # print(loss_align.shape, loss_bools.shape )
+
+        en_token_dict = {}
+        for i, token in enumerate(en_bert_tokens):
+            if token.startswith('##'):
+                continue
+
+            word = token
+            pos = i + 1
+            while pos < len(en_bert_tokens):
+                if not en_bert_tokens[pos].startswith('##'):
+                    break
+                word += en_bert_tokens[pos]
+                pos += 1
+            if word in en_token_dict:
+                en_token_dict[word] = False    
+            en_token_dict[word] = (i, pos - i + 1)
+
+            # # print('ET>', token)
+            # word = token
+            # pos = i + 1
+            # while pos < len(en_bert_tokens):
+            #     if not en_bert_tokens[pos].startswith('##'):
+            #         break
+            #     word += en_bert_tokens[pos]
+            #     pos += 1
+            
+
+            # if token not in en_token_dict:
+            #     en_token_dict[token] = [i]
+            # else:
+            #     en_token_dict[token].append(i)
+
+        words = []
+        for i, token in enumerate(codemix_bert_tokens):
+            if token.startswith('##'):
+                continue
+
+            word = token
+            pos = i + 1
+            while pos < len(codemix_bert_tokens):
+                if not codemix_bert_tokens[pos].startswith('##'):
+                    break
+                word += codemix_bert_tokens[pos]
+                pos += 1
+            if word in en_token_dict:
+                # print(word)
+                # words.append(word)
+                assert en_token_dict[word] is not False
+                aligned_i = en_token_dict[word][0]
+                n_tokens = pos - i
+                for id in range(n_tokens):
+                    loss_align[i + id + 1] = aligned_i + id + 1 # CLS TOKEN is 0th token
+                    loss_bools[i + id + 1] = True
+
+                # assert word in en_token_dict, f'{word}'
+            # en_token_dict[word] = (i, pos - i + 1)
+
+        # loss_bools[0] = True
+        # loss_align[0] = 0
+
+        # print(loss_align[:20])
+
+        # print(loss_align, loss_bools)
+            # # print('CT>', token)
+            # if token in en_token_dict:
+            #     loss_align[i] = en_token_dict[token][0]
+            #     loss_bools[i] = True
+            #     assert len(en_token_dict[token]) == 1
+            # # else:
+            #     # en_token_dict[token].append(i)
+        return loss_align, loss_bools
+
+
+
+        # cm_id = 0
+        # en_id = 0
+
+
+
+        # print(aligns)
+
+        # bert_sent = ''
+        # for x in codemix_bert_tokens:
+        #     if x.startswith('##'):
+        #         bert_sent += x[2:]
+        #     else:
+        #         bert_sent += f'{x}'
+
+        # bert_sent = bert_sent.strip()
+
+        # processed = ''
+        # matches = 0
+        # for (ja_word_id, align) in aligns:
+
+        #     while cm_id < len(codemix_bert_tokens):
+        #         cm_token = codemix_bert_tokens[cm_id]
+        #         cm_id += 1
+        #         if cm_token.startswith('##'):
+        #             continue
+        #         if align[1].startswith(cm_token) or cm_token.startswith(align[1]):
+        #             print(cm_id, cm_token)
+                    
+        #             for i, token in enumerate(en_bert_tokens):
+        #                 if token == cm_token:
+        #                     loss_align[cm_id] = i
+        #                     loss_bools[cm_id] = True
+        #                     pos = i + 1
+        #                     matches += 1
+        #                     while pos < len(en_bert_tokens):
+        #                         if not token.startswith('##'):
+        #                             break
+        #                         loss_align[cm_id + 1] = pos
+        #                         loss_bools[cm_id + 1] = True
+        #                     break
+
+        # assert matches == len(aligns)
+
+        # # assert processed == bert_sent, f'{processed} ||| {bert_sent}'            
+
+        # return loss_align, loss_bools
+
     def tensorize_example(self, example, cls_token_at_end=False, pad_on_left=False,
                     cls_token='[CLS]', sep_token='[SEP]', pad_token=0,
                     sequence_a_segment_id=0, sequence_b_segment_id=1,
                     cls_token_segment_id=1, pad_token_segment_id=0,
-                    mask_padding_with_zero=True):
+                    mask_padding_with_zero=True, teacher_features=None):
 
-        tokens_a = self.tokenizer.tokenize(example.text_a)
+        # text_a = example.text_a[self.args.lang]
+        # print(tokens_en, text_a)
 
+        tokens_a = self.tokenizer.tokenize(example.text_a[self.args.lang])
         tokens_b = None
+
+        loss_align_t, loss_bools_t = None, None
+
+        word_align = example.word_align[self.args.lang] if self.args.lang in example.word_align else None
+        if self.args.do_kd is True and self.args.codemix is True and self.name == 'train':
+            candidates = []
+            freq_words = {}
+
+            english = example.text_a['en']
+            tokens_en = word_tokenize(english)
+            bert_en_tokens = self.teacher_tokenizer.tokenize(english)
+
+            word_align = example.word_align[self.args.lang]
+            for i, word in enumerate(word_align):
+                if len(word) < 3:
+                    continue
+                en_id = int(word[2])
+                en_word = tokens_en[en_id]
+                if en_word not in freq_words:
+                    freq_words[en_word] = 1
+                else:
+                    freq_words[en_word] += 1
+
+            for i, word in enumerate(word_align):
+                if len(word) < 3:
+                    continue
+                en_id = int(word[2])
+                en_word = tokens_en[en_id]
+                # print(word[0], en_word)
+                if freq_words[en_word] == 1 and self.same_tokenization(en_word, [self.tokenizer, self.teacher_tokenizer]):
+                    candidates.append((i, word))
+            # print(f'{len(candidates)} / {len(tokens_a)} = {len(candidates) / len(tokens_a) * 100}%')
+
+            random.shuffle(candidates)
+
+            n_codemix = min(max(1, round(0.15 * len(tokens_a))), len(candidates))
+
+            assert n_codemix <= len(candidates)
+            candidates = candidates[:n_codemix]
+
+            candidates = sorted(candidates)
+
+            # print(candidates)
+
+            # jap_words = [word[0] for word in word_align]
+            codemix = [word[0] for word in word_align]
+
+            # print(codemix)
+
+            for word in candidates:
+                (jap_word_id, (jap_word, en_word, en_id)) = word
+                codemix[jap_word_id] = f' {en_word} '
+            if self.args.lang == 'ja':
+                codemix = ''.join(codemix).strip()
+            else:
+                codemix = ' '.join(codemix).strip()
+            codemix = codemix.replace('  ', ' ')
+
+            # print(codemix)
+
+            tokens_a = self.tokenizer.tokenize(codemix)
+
+            # print(tokens_a)
+
+            loss_align, loss_bools = self.get_codemix_align((bert_en_tokens, tokens_a), candidates)
+
+            loss_align_t = torch.zeros((178), dtype=torch.short)
+            loss_align_t[:len(tokens_a) + 1] = loss_align
+            loss_bools_t = torch.zeros((178), dtype=torch.bool)
+            loss_bools_t[:len(tokens_a) + 1] = loss_bools
+
+            # for token in tokens_a:
+                # print(token)
+            # print('\n')
+
+            # for token in 
+        # print(codemix)
+
+
+        # for word in word_align:
+            # print(word[0], end=' ')
+        # print('\n')
+
         if example.text_b:
             tokens_b = self.tokenizer.tokenize(example.text_b)
             # Modifies `tokens_a` and `tokens_b` in place so that the total length is less than the specified length.
@@ -273,6 +699,7 @@ class VQADataset(Dataset):
             tokens = [cls_token] + tokens
             segment_ids = [cls_token_segment_id] + segment_ids
 
+        # print(tokens)
         input_ids = self.tokenizer.convert_tokens_to_ids(tokens)
 
         # The mask has 1 for real tokens and 0 for padding tokens. Only real tokens are attended to.
@@ -353,30 +780,143 @@ class VQADataset(Dataset):
             #img_feat = img_feat.reshape(-1, img_feat.shape[0])
             img_feat = img_feat.type(torch.float)
 
+        # TODO: Tensorize teacher features
         return (torch.tensor(input_ids, dtype=torch.long),
                 torch.tensor(input_mask, dtype=torch.long),
                 torch.tensor(segment_ids, dtype=torch.long),
                 torch.tensor([label_id[0]], dtype=torch.long),
                 torch.tensor(new_scores, dtype=torch.float),
                 img_feat,
-                torch.tensor([example.q_id], dtype=torch.long))
+                torch.tensor([example.q_id], dtype=torch.long)), (loss_align_t, loss_bools_t), tokens
+                # teacher_features)
+
+    def get_tokens(self, index, tokenizer, language='hi', cls_token_at_end=False, pad_on_left=False,
+            cls_token='[CLS]', sep_token='[SEP]', pad_token=0,
+            sequence_a_segment_id=0, sequence_b_segment_id=1,
+            cls_token_segment_id=1, pad_token_segment_id=0,
+            mask_padding_with_zero=True):
+        example = self.examples[0: ][index]
+
+        assert language in ['en', 'hi', 'ja']
+
+        tokens_a = tokenizer.tokenize(example.text_a[language])
+        tokens_b = None
+        if example.text_b:
+            tokens_b = tokenizer.tokenize(example.text_b)
+            # Modifies `tokens_a` and `tokens_b` in place so that the total length is less than the specified length.
+            # Account for [CLS], [SEP], [SEP] with "- 3"
+            _truncate_seq_pair(tokens_a, tokens_b, self.args.max_seq_length - 3)
+        else:
+            # Account for [CLS] and [SEP] with "- 2"
+            if len(tokens_a) > self.args.max_seq_length - 2:
+                tokens_a = tokens_a[:(self.args.max_seq_length - 2)]
+
+        tokens = tokens_a + [sep_token]
+        segment_ids = [sequence_a_segment_id] * len(tokens)
+
+        if tokens_b:
+            tokens += tokens_b + [sep_token]
+            segment_ids += [sequence_b_segment_id] * (len(tokens_b) + 1)
+
+        if cls_token_at_end:
+            tokens = tokens + [cls_token]
+            segment_ids = segment_ids + [cls_token_segment_id]
+        else:
+            tokens = [cls_token] + tokens
+            segment_ids = [cls_token_segment_id] + segment_ids
+
+        return tokens
 
     def __getitem__(self, index):
+        # print(self.teacher_model)
+        # if self.teacher_model is not None:
+            # teacher_example = self.teacher_data_loader[index]
+
+            # input = {'input_ids':      teacher_example[0],
+            #          'attention_mask': teacher_example[1],
+            #          'token_type_ids': teacher_example[2] if self.args.model_type in ['bert', 'xlnet'] else None,  # XLM don't use segment_ids
+            #          'labels':         teacher_example[4],
+            #          'img_feats':      None if self.args.img_feature_dim == -1 else teacher_example[5]}
+
+            # for key in input:
+            #     input[key] = input[key].unsqueeze(dim=0)
+            #     # input[key].to(self.args.device)
+            #     # print(f'{key} device = {input[key].device}')
+
+            # # print(f'Loaded {input} for training!')
+            # # input = input.unsqueeze()
+            # # print(f'teacher model device = {self.teacher_model.device}')
+            # teacher_outputs = self.teacher_model(**input)
+            # print(f'Loaded {teacher_outputs.shape} for loss!')
+
+            # teacher_outputs = torch.zeros((1, 178, 768))
+
         if self.args.load_fast:
+            # print('Loading fast...')
             example = self.features[index]
         else:
+            # print('Normal loading...')
             entry = self.examples[index]
-            example = self.tensorize_example(entry,
+            example, codemix_align, hi_tokens = self.tensorize_example(entry,
                 cls_token_at_end=bool(self.args.model_type in ['xlnet']), # xlnet has a cls token at the end
                 cls_token=self.tokenizer.cls_token,
                 sep_token=self.tokenizer.sep_token,
                 cls_token_segment_id=2 if self.args.model_type in ['xlnet'] else 0,
                 pad_on_left=bool(self.args.model_type in ['xlnet']), # pad on the left for xlnet
                 pad_token_segment_id=4 if self.args.model_type in ['xlnet'] else 0)
+                # teacher_features=self.teacher_features[index] if self.name == 'train' else None)
+        # example.append(teacher_outputs[1])
+        # if self.teacher_model is not None:
+                # return (example, teacher_outputs[0, ...])
+                # print('E', example, example[-1].shape)
+        
+        if self.args.do_kd and self.name == 'train':
+            # teacher_features = self.teacher_features[index]
+            # to_remove = [x for x in teacher_features.keys() if x not in self.args.layers]
+            # for k in to_remove:
+                # del teacher_features[k]
+
+            # return example, teacher_features
+            en_tokens = self.get_tokens(index, self.teacher_tokenizer, language='en')
+            # hi_tokens = self.get_tokens(index, self.tokenizer, language=self.args.lang)
+
+            # print(len(en_tokens), len(hi_tokens))
+
+            # if 'word_align' in example.keys():
+                # print(example.word_align)
+
+            # en_tokens = tuple(en_tokens)
+            # hi_tokens = tuple(hi_tokens)
+
+            hi_tokens = '<SPLIT>'.join(hi_tokens)
+            en_tokens = '<SPLIT>'.join(en_tokens)
+
+            tokens = [hi_tokens, en_tokens]
+
+            # for i, word in enumerate(word_align):
+            #     word = [str(x) for x in word]
+            #     word_align[i] = '~!~'.join(word)
+
+            # word_align = '~%~'.join(word_align)
+
+            # print(codemix_align)
+
+            if codemix_align[0] is None:
+                return example, index, tokens
+            return example, index, tokens, codemix_align
+        # elif self.name == 'train':
+            # teacher_features = self.teacher_features[index]
+            # to_remove = [x for x in teacher_features.keys() if x not in self.args.layers]
+            # for k in to_remove:
+                # del teacher_features[k]
+
+            # return example
         return example
 
     def __len__(self):
-        return len(self.examples)
+        if self.args.do_kd is False or self.teacher_features is None:
+            return len(self.examples)
+        return min(len(self.teacher_features), len(self.examples))
 
     # tsv feature loading
     def load_img_tsv_features(self):
@@ -455,7 +995,7 @@ def trim_batch(batch):
     return batch_tensors
 
 
-def train(args, train_dataset, eval_dataset, model, tokenizer):
+def train(args, train_dataset, eval_dataset, model, tokenizer, teacher_tokenizer):
     """ Train the model """
     #if args.local_rank in [-1, 0]: tb_writer = SummaryWriter()
 
@@ -526,6 +1066,7 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
     for epoch in range(int(args.num_train_epochs)):
     #for epoch in train_iterator:
         #epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
+
         total_loss = 0
         train_score = 0
         total_norm = 0
@@ -550,19 +1091,121 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
         #epoch = 20
         #global_step = epoch*math.ceil(len(train_dataset)/(args.train_batch_size * args.gradient_accumulation_steps * (torch.distributed.get_world_size() if args.local_rank != -1 else 1)))
 
+        time_spent = 0
         t_start = time.time()
-        for step, batch in enumerate(train_dataloader):
+        t_batch_start = time.time()
+        t_first = None
+        for step, batch in tqdm(enumerate(train_dataloader)):
+            # break
+            t_batch_end = time.time()                
+            # torch.cuda.empty_cache()
+            # print(f'Loaded batch in {t_batch_end - t_batch_start}')
+            teacher_outputs = None
+            loss_align = None
+            if args.do_kd:
+                if args.codemix:
+                    (batch, teacher_outputs, tokens, codemix_align) = batch
+                else:
+                    (batch, teacher_outputs, tokens) = batch
+                # for v in teacher_outputs.values():
+                    # v.to(args.device)
+                teacher_outputs = list(teacher_outputs)
+
+                if args.codemix:
+                    cm_align, cm_bools = codemix_align
+
+                    if cm_align is not None:
+                        cm_align.to(args.device)
+                        cm_bools.to(args.device)
+                # codemix_align.to(args.device)
+
+                # print(len(codemix_align))
+                # print('>>>', codemix_align[0].shape)
+                # teacher_outputs = [torch.tensor(x) for x in teacher_outputs]
+                # print(teacher_outputs)
+
+                # word_align = [x.split('~%~') for x in word_align]
+                # word_align = [[x.split('~!~') for x in word] for word in word_align]
+
+                # print(word_align)
+
+                hi_tokens = [tokenized.split('<SPLIT>') for tokenized in tokens[0]]
+                en_tokens = [tokenized.split('<SPLIT>') for tokenized in tokens[1]]
+
+
+                # print(hi_tokens[0])
+                # print(en_tokens[0])
+
+                aligns = []
+                bools = []
+
+                for i in range(len(en_tokens)):
+                    en, hi = en_tokens[i], hi_tokens[i]
+                    if args.codemix:
+                        align, bool = get_align(en, hi, (cm_align[i, :], cm_bools[i, :]), no_tags=args.no_tags, no_images=args.no_images, no_cls=args.no_cls)
+                    else:
+                        align, bool = get_align(en, hi, (None, None), no_tags=args.no_tags, no_images=args.no_images, no_cls=args.no_cls)
+
+                    # print(align, bool)
+                    aligns.append(align)
+                    bools.append(bool)
+
+                aligns = torch.stack(aligns, dim=0)
+                bools = torch.stack(bools, dim=0)
+
+                loss_align = (aligns, bools)
+                # print(token_aligns[0])
+
+                # print(tokens[0][ :, 0])
+
+                # print(teacher_align[0])
+
+                teacher_outputs = torch.stack(teacher_outputs, dim=0)
+                # print(teacher_outputs)
+
+                # t_torch_start = time.time()
+
+                # # Loading threads
+
+                # workers = 16
+                # threads = []
+                # for worker in range(workers):
+                #     threads.append(threading.Thread(target=teacher_load, args=(teacher_outputs, worker, workers, args.device)))
+
+                # for thread in threads:
+                #     thread.start()
+
+                # for thread in threads:
+                #     thread.join()
+
+                # # for k in range(len(teacher_outputs)):
+                #     # teacher_outputs[k] = torch.load(teacher_outputs[k], map_location=torch.device(args.device))
+                # t_torch = time.time() - t_torch_start
+                # teacher_outputs = tuple(teacher_outputs)
+                # [v.to(args.device) for v in teacher_outputs.values()]
+
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
-            inputs = {'input_ids':      batch[0],
-                      'attention_mask': batch[1],
-                      'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,  # XLM don't use segment_ids
-                      'labels':         batch[4],
-                      'img_feats':      None if args.img_feature_dim == -1 else batch[5]}
+
+            # for i, sample in enumerate(batch[0]):
+                # print(i, sample.device)
+
+            inputs = {'input_ids':       batch[0],
+                      'attention_mask':  batch[1],
+                      'token_type_ids':  batch[2] if args.model_type in ['bert', 'xlnet'] else None,  # XLM don't use segment_ids
+                      'labels':          batch[4],
+                      'img_feats':       None if args.img_feature_dim == -1 else batch[5],
+                      'teacher_outputs': teacher_outputs,
+                      'loss_align':      loss_align}
+            t_pass_start = time.time()
             outputs = model(**inputs)
+            t_pass_end = time.time()
+
+            # print(f'Passed the model in {t_pass_end - t_pass_start}')
 
             #loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
             loss, logits = outputs[:2]
+            # print(loss.shape, logits.shape)
 
             #loss = instance_bce_with_logits(logits, batch[4])
 
@@ -571,6 +1214,9 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
 
+            print(f'Loss = {round(loss.item(), 4)}', flush=True)
+
+            t_back_start = time.time()
             if args.fp16:
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
                     scaled_loss.backward()
@@ -579,6 +1225,7 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
                 loss.backward()
                 total_norm += torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 count_norm += 1
+            t_back_end = time.time()
 
             batch_score = compute_score_with_logits(logits, batch[4]).sum()
             train_score += batch_score.item()
@@ -614,6 +1261,26 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
             #    epoch_iterator.close()
             #    break
 
+            t_batch_time = time.time() - t_batch_start
+            if t_first is None:
+                t_first = t_batch_time
+            t_pass_time = t_pass_end - t_pass_start
+            t_back_time = t_back_end - t_back_start
+            t_load_time = t_batch_end - t_batch_start
+
+            # print(f'{round(t_pass_time / t_batch_time * 100, 2)}% in pass')
+            # print(f'{round(t_back_time / t_batch_time * 100, 2)}% in back')
+            # print(f'{round(t_load_time / t_batch_time * 100, 2)}% in loading')
+            # # print(f'{round(t_torch / t_batch_time * 100, 2)}% in teacher loading')
+            # print(f'{round(t_batch_time, 2)} sec in total')
+
+            time_spent += t_batch_time
+            if step > 0:
+                epoch_avg = ((time_spent - t_first) / (step)) * (634516 / args.train_batch_size)
+                # print(f'{round(epoch_avg / 60 / 60, 2)} hours per epoch')
+
+            t_batch_start = time.time()
+
         # evaluation
         logger.info("Epoch: %d, global_step: %d" % (epoch, global_step))
         eval_result, eval_score, upper_bound = evaluate(args, model, eval_dataset, prefix=global_step)
@@ -627,7 +1294,12 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
         if (args.local_rank in [-1, 0]) and (args.save_epoch>0 and epoch%args.save_epoch == 0) and (epoch>args.save_after_epoch):
             output_dir = os.path.join(args.output_dir, 'checkpoint-{}-{}'.format(epoch, global_step))
             if not os.path.exists(output_dir): os.makedirs(output_dir)
-            model_to_save = best_model['model'].module if hasattr(model, 'module') else best_model['model']  # Take care of distributed/parallel training
+
+            # Save all epochs when running KD
+            if args.do_kd is True:
+                model_to_save = model.module if hasattr(model, 'module') else model  # Take care of distributed/parallel training
+            else:
+                model_to_save = best_model['model'].module if hasattr(model, 'module') else best_model['model']  # Take care of distributed/parallel training
 
             save_num = 0
             while (save_num < 10):
@@ -661,7 +1333,7 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
         with open(args.output_dir + '/eval_logs.json', 'w') as fp:
             json.dump(log_json, fp)
 
-        output_dir = os.path.join(args.output_dir, 'best-{}'.format(best_model['epoch']))
+        output_dir = os.path.join(args.output_dir, 'best')
         if not os.path.exists(output_dir): os.makedirs(output_dir)
         model_to_save = best_model['model'].module if hasattr(model, 'module') else best_model['model']  # Take care of distributed/parallel training
 
@@ -729,6 +1401,9 @@ def evaluate(args, model, eval_dataset=None, prefix=""):
                 batch_score = torch.sum(
                     compute_score_with_logits(logits, batch[4]), 1)
                 # update results_dict
+                # print('###', logits.shape, batch[4].shape, batch_score.shape)
+                # print(torch.argmax(logits, dim=1), torch.argmax(batch[4], dim=1), batch_score)
+                # print(batch_score)
                 results_dict.update(
                     {qa_ind: score for qa_ind, score in
                      zip(batch[6].view(-1).tolist(), batch_score.tolist())}
@@ -745,6 +1420,9 @@ def evaluate(args, model, eval_dataset=None, prefix=""):
 
             nb_eval_steps += 1
 
+            if nb_eval_steps % 25 == 0:
+                print(512 * nb_eval_steps * 100 / len(eval_dataloader.dataset))
+
             #if preds is None:
             #    preds = logits.detach().cpu().numpy()
             #    out_label_ids = inputs['labels'].detach().cpu().numpy()
@@ -759,6 +1437,7 @@ def evaluate(args, model, eval_dataset=None, prefix=""):
         logger.info("Eval Score: %.3f" % (100*score))
         logger.info("EVALERR: {}%".format(100*score))
         logger.info("Eval Upper Bound: %.3f" % (100*upper_bound))
+        print(f"Eval Score: {100 * score}", flush=True)
         # with open(os.path.join(args.data_dir, 'val_results.json'),
         #           'w') as f:
         #     json.dump(results_dict, f)
@@ -918,6 +1597,13 @@ def target_tensor(len, labels, scores):
 
     return target
 
+def freeze_model(model, freeze=True):
+    classification_layers = ['classifier.weight', 'classifier.bias']
+    for (name, param) in model.named_parameters():
+        if name in classification_layers:
+            param.requires_grad_(True)
+        else:
+            param.requires_grad_(not freeze)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -928,10 +1614,19 @@ def main():
     parser.add_argument("--txt_data_dir", default=None, type=str, required=True,
                         help="The input text data dir. Should contain the .json files (or other data files) for the task.")
 
+    parser.add_argument("--only_classifier", action='store_true', help="Whether to train only the classifier.", default=False)
+    parser.add_argument("--codemix", action='store_true', help="Whether to apply kd on code-mix sentences.", default=False)
+    parser.add_argument("--no_tags", action='store_true', help="Whether to ignore kd on object tags.", default=False)
+    parser.add_argument("--no_images", action='store_true', help="Whether to ignore kd on image tokens.", default=False)
+    parser.add_argument("--no_cls", action='store_true', help="Whether to ignore kd on CLS token.", default=False)
     parser.add_argument("--model_type", default=None, type=str, required=True,
                         help="Model type selected in the list: " + ", ".join(MODEL_CLASSES.keys()))
     parser.add_argument("--model_name_or_path", default=None, type=str, required=True,
                         help="Path to pre-trained model or shortcut name")
+    parser.add_argument("--teacher_features_dir", default=None, type=str, required=True,
+                        help="Path to the features extracted by the teacher model")
+    parser.add_argument("--lang", default='hi', type=str, required=True,
+                        help="Target language of the student model: hi, ja")
     parser.add_argument("--task_name", default=None, type=str, required=True,
                         help="The name of the task to train selected in the list: " + ", ".join(processors.keys()))
     parser.add_argument("--output_dir", default=None, type=str, required=True,
@@ -1014,6 +1709,9 @@ def main():
     parser.add_argument("--load_fast", action='store_true', help="Load Tensor Fast")
     parser.add_argument('-j', '--workers', default=0, type=int, metavar='N', help='number of data loading workers (default: 4)')
 
+    parser.add_argument('--layers', '-l', nargs='+', default=[], help='The list of layers to extract features from', required=False)
+
+    parser.add_argument("--do_kd", action='store_true', help="Whether to use knowledge distillation", default=False)
     #args = '--data_dir ../vqa/ban-vqa/data/qal_pairs --model_type bert --model_name_or_path bert-base-uncased --task_name vqa_text ' \
     #       '--do_train --do_eval --do_lower_case --max_seq_length 40 --per_gpu_eval_batch_size 16 --per_gpu_train_batch_size 16 --learning_rate 2e-5 ' \
     #       '--num_train_epochs 20.0 --output_dir ./results/vqa_text --label_file ../vqa/ban-vqa/data/cache/trainval_ans2label.pkl ' \
@@ -1027,6 +1725,27 @@ def main():
     #args = parser.parse_args(args.split())
 
     args = parser.parse_args()
+
+    if args.do_kd:
+        print('Extracting features from these layers:')
+        print(args.layers)
+        layers = set([x.strip() for x in args.layers if x.strip() != ''])
+
+        USER = os.environ['USER']
+        cached_features_metadata = f'{args.teacher_features_dir}/layers.txt'
+        if os.path.exists(cached_features_metadata):
+            cached_layers = set()
+            with open(cached_features_metadata, 'r') as f:
+                cached_layers = f.readlines()
+            cached_layers = set([x.strip() for x in cached_layers if x.strip() != ''])
+            print(cached_layers)
+
+            if not layers.issubset(cached_layers):
+                print('All features not found!')
+                exit(0)
+        print('Teacher features found!')
+    else:
+        print('Training from scratch!')
 
     if args.philly:  # use philly
         logger.info('Info: Use Philly, all the output folders are reset.')
@@ -1083,11 +1802,23 @@ def main():
 
     args.model_type = args.model_type.lower()
     config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
+    assert(args.config_name is "")
     config = config_class.from_pretrained(
         args.config_name if args.config_name else args.model_name_or_path,
         num_labels=num_labels, finetuning_task=args.task_name,
     )
+    # teacher_config = config_class.from_pretrained(
+    #     args.config_name if args.config_name else args.teacher_model_name_or_path,
+    #     num_labels=num_labels, finetuning_task=args.task_name,
+    # )
+
+
+    assert(args.tokenizer_name is "")
     tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, do_lower_case=args.do_lower_case)
+    
+    teacher_tokenizer=None
+    if args.do_kd:
+        teacher_tokenizer = tokenizer_class.from_pretrained('bert-base-uncased', do_lower_case=args.do_lower_case)
 
     # discrete code
     config.img_feature_dim = args.img_feature_dim
@@ -1098,7 +1829,18 @@ def main():
     config.classifier = args.classifier
     config.cls_hidden_scale = args.cls_hidden_scale
     #config.use_img_layernorm = args.use_img_layernorm
-    
+    # config.is_teacher_model = False
+
+    # # teacher_config
+    # teacher_config.img_feature_dim = args.img_feature_dim
+    # teacher_config.img_feature_type = args.img_feature_type
+    # teacher_config.code_voc = args.code_voc
+    # teacher_config.hidden_dropout_prob = args.drop_out
+    # teacher_config.loss_type = args.loss_type
+    # teacher_config.classifier = args.classifier
+    # teacher_config.cls_hidden_scale = args.cls_hidden_scale
+    # teacher_config.is_teacher_model = True
+
     # load discrete code
     if args.img_feature_type in ['dis_code', 'dis_code_t']:
         logger.info('Load discrete code from: {}'.format(args.data_dir))
@@ -1124,10 +1866,30 @@ def main():
         elif args.code_level == 'bottom':
             model.init_code_embedding(train_code['embeddings_b'].t())
 
+    if args.only_classifier is True:
+        freeze_model(model, freeze=True)
+
+    # teacher_model = model_class.from_pretrained(args.teacher_model_name_or_path, from_tf=bool('.ckpt' in args.teacher_model_name_or_path), config=teacher_config)
+    # for p in teacher_model.parameters():
+    #     p.requires_grad = False
+    # # teacher_model.requires_grad = False
+    # teacher_model.eval()
+    # print('Teacher Model: ', teacher_model)
+    
+    # exit(0)
+
+    # TODO: Remove
+    # model = teacher_model
+
+    # train_layers = ['classifier.weight', 'classifier.bias']
+    # for (name, param ) in model.named_parameters():
+    #     if name not in train_layers:
+    #         param.requires_grad_(False)
+    #     else:
+    #         print('Training ', name)
+
     if args.local_rank == 0:
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
-
-    print(model)
 
     model.to(args.device)
 
@@ -1145,14 +1907,17 @@ def main():
     # Training
     if args.do_train:
         #train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
-        train_dataset = VQADataset(args, 'train', tokenizer)
-        global_step, tr_loss = train(args, train_dataset, eval_dataset, model, tokenizer)
+        # train_dataset = VQADataset(args, 'train', tokenizer, (teacher_tokenizer, teacher_model))
+        train_dataset = VQADataset(args, 'train', tokenizer, teacher_tokenizer=teacher_tokenizer)
+        print('Training set ready!')
+        global_step, tr_loss = train(args, train_dataset, eval_dataset, model, tokenizer, teacher_tokenizer)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
     # Training on train+val
     if args.do_train_val:
-        train_dataset = VQADataset(args, 'train+val', tokenizer)
-        global_step, tr_loss = train(args, train_dataset, eval_dataset, model, tokenizer)
+        # train_dataset = VQADataset(args, 'train+val', tokenizer, (teacher_tokenizer, teacher_model))
+        train_dataset = VQADataset(args, 'train+val', tokenizer, teacher_tokenizer=teacher_tokenizer)
+        global_step, tr_loss = train(args, train_dataset, eval_dataset, model, tokenizer, teacher_tokenizer)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
     # Saving best-practices: if you use defaults names for the model, you can reload it using from_pretrained()
@@ -1188,9 +1953,9 @@ def main():
         for checkpoint in checkpoints:
             global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
             print(checkpoint)
-            model = model_class.from_pretrained(checkpoint, config=config)
+            # model = model_class.from_pretrained(checkpoint, config=config)
             print('model = ', model)
-            model.to(args.device)
+            # model.to(args.device)
             result, score, upper_bound = evaluate(args, model, eval_dataset, prefix=global_step)
             #result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
             #results.update(result)

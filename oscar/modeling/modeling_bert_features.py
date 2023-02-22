@@ -16,12 +16,13 @@ from transformers.pytorch_transformers.modeling_bert import (BertEmbeddings,
         load_tf_weights_in_bert)
 from .modeling_utils import CaptionPreTrainedModel, ImgPreTrainedModel
 from ..utils.cbs import ConstrainedBeamSearch, select_best_beam_with_constraints
+import numpy as np
 import os
 
 logger = logging.getLogger(__name__)
 
 NUM_LABELS = int(os.environ['NUM_LABELS'])
-LOGIT_LOSS = False
+
 
 class CaptionBertSelfAttention(BertSelfAttention):
     """
@@ -99,84 +100,13 @@ class CaptionBertEncoder(BertEncoder):
         self.output_attentions = config.output_attentions
         self.output_hidden_states = config.output_hidden_states
         self.layer = nn.ModuleList([CaptionBertLayer(config) for _ in range(config.num_hidden_layers)])
-        self.USER = os.environ['USER']
-        self.SSD = os.environ['SSD']
-
-        self.FINAL_LAYER_ONLY = False
-        if 'FINAL_LAYER_ONLY' in os.environ.keys() and os.environ['FINAL_LAYER_ONLY'] == '1':
-            self.FINAL_LAYER_ONLY = True
-
-        if self.SSD == '1':
-            self.feature_dir = f'/ssd_scratch/cvit/{self.USER}/features'
-            if self.USER == 'devanshg27':
-                self.feature_dir = f'/ssd_scratch/users/devanshg27/features'                
-        else:
-            self.feature_dir = f'/scratch/{self.USER}/datasets/oscar/vqa/features'
-        # MANUAL: Need to update manually hardcoded for now! TODO!
-        # self.feature_dir = f'/ssd_scratch/cvit/{self.USER}/features'
 
     def forward(self, hidden_states, attention_mask, head_mask=None,
-                encoder_history_states=None, teacher_outputs=None, loss_align=None):
+                encoder_history_states=None, extract_layers=set()):
         all_hidden_states = ()
         all_attentions = ()
-        loss = None
-        do_kd = teacher_outputs is not None
-
-        device = int(str(hidden_states.device)[-1])
-
-        # print(hidden_states.shape)
-        if do_kd:
-            align, loss_bools = loss_align
-            align = align.type(torch.long)
-
-            # print(align)
-
-            teacher_feats = []
-            for i, x in enumerate(teacher_outputs):
-                x = torch.load(f'{self.feature_dir}/{x.item()}.pt', map_location=lambda storage, loc: storage.cuda(device))
-                for k in x:
-                    if k == 'logits':
-                        continue
-                    # print(x[k].shape)
-                    gap = torch.zeros((hidden_states.shape[1] - x[k].shape[0], hidden_states.shape[2]), device=f'cuda:{device}')
-                    x[k] = torch.cat((x[k][:-50, :], gap, x[k][-50:, :]), dim=0)
-                    # if k == 'encoder11' and i == 0 and device == 0:
-                    #     print('B', x[k][0, :5])
-                    #     print('B', x[k][1, :5])
-                    x[k] = x[k][align[i]]
-                    # if k == 'encoder11' and i == 0 and device == 0:
-                    #     print('A', x[k][0, :5])
-                    #     print('A', x[k][1, :5])
-                    # print(x[k].shape)
-
-                teacher_feats.append(x)
-            teacher_outputs = {}
-            for k in teacher_feats[0].keys():
-                if k == 'logits':
-                    continue
-                teacher_outputs[k] = []
-
-            for k in teacher_feats[0].keys():
-                if k == 'logits':
-                    continue
-                for x in teacher_feats:
-                    teacher_outputs[k].append(x[k])
-                teacher_outputs[k] = torch.stack(teacher_outputs[k], dim=0)
-                # teacher_outputs[k] = teacher_outputs[k][align]
-
-            # print(loss_align)
-
-
-        encoder_loss_fn = MSELoss()
-        cls_loss_fn = MSELoss()
-        image_token_loss_fn = MSELoss()
-
+        extracted = {}
         for i, layer_module in enumerate(self.layer):
-            teacher_i = i
-
-            if teacher_i >= 12:
-                break
-
             if self.output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
@@ -185,47 +115,18 @@ class CaptionBertEncoder(BertEncoder):
                     hidden_states, attention_mask, head_mask[i],
                     history_state)
             hidden_states = layer_outputs[0]
-
-            encoder_kd = do_kd and (f'encoder{teacher_i}' in teacher_outputs)
-
-            if do_kd and encoder_kd and (not self.FINAL_LAYER_ONLY or teacher_i == 11):
-                # Apply loss on object tags and code-mixed language
-                # pass
-
-                # temp_bools = loss_bools
-                # print('>', temp_bools.shape)
-
-                curr_loss = encoder_loss_fn(teacher_outputs[f'encoder{teacher_i}'][loss_bools], hidden_states[loss_bools])
-
-                # if teacher_i == 11:
-                    # curr_loss = curr_loss
-
-                if loss is None:
-                    loss = curr_loss
-                else:
-                    loss = loss + curr_loss
-                # pass
-
-            # if do_kd and (encoder_kd or f'image{teacher_i}' in teacher_outputs):
-            #     # Calculating image token loss, add added support from another layer name
-            #     if encoder_kd:
-            #         curr_loss = image_token_loss_fn(teacher_outputs[f'encoder{teacher_i}'][:, -50:, :], hidden_states[:, -50:, :])
-            #     else:
-            #         curr_loss = image_token_loss_fn(teacher_outputs[f'image{teacher_i}'], hidden_states[:, -50:, :])
-            #     if loss is None:
-            #         loss = curr_loss
-            #     else:
-            #         loss = loss + curr_loss
-
-            # if do_kd and (encoder_kd or f'cls{teacher_i}' in teacher_outputs):
-            #     if encoder_kd:
-            #         curr_loss = cls_loss_fn(teacher_outputs[f'encoder{teacher_i}'][:, 0:, :], hidden_states[:, 0:, :])
-            #     else:
-            #         curr_loss = cls_loss_fn(teacher_outputs[f'cls{teacher_i}'], hidden_states[:, 0, :])
-            #     if loss is None:
-            #         loss = curr_loss
-            #     else:
-            #         loss = loss + curr_loss
+            if f'encoder{i}' in extract_layers:
+                # extracted[f'encoder{i}'] = hidden_states.cpu().data.numpy().astype(np.float16)
+                # extracted[f'encoder{i}'] = torch.from_numpy(extracted[f'encoder{i}'])
+                extracted[f'encoder{i}'] = hidden_states.cpu().data.type(torch.HalfTensor)
+            if f'cls{i}' in extract_layers:
+                # extracted[f'cls{i}'] = hidden_states[:, 0, :].cpu().data.numpy().astype(np.float16)
+                # extracted[f'cls{i}'] = torch.from_numpy(extracted[f'cls{i}'])
+                extracted[f'cls{i}'] = hidden_states[:, 0, :].cpu().data.type(torch.HalfTensor)
+            if f'image{i}' in extract_layers:
+                # extracted[f'image{i}'] = hidden_states[:, -50:, :].cpu().data.numpy().astype(np.float16)
+                # extracted[f'image{i}'] = torch.from_numpy(extracted[f'image{i}'])
+                extracted[f'image{i}'] = hidden_states[:, -50:, :].cpu().data.type(torch.HalfTensor)
 
             if self.output_attentions:
                 all_attentions = all_attentions + (layer_outputs[1],)
@@ -240,11 +141,10 @@ class CaptionBertEncoder(BertEncoder):
         if self.output_attentions:
             outputs = outputs + (all_attentions,)
 
-        return outputs, loss
-        # if loss is not None:
-            # return outputs, loss
+        if len(extract_layers) > 0:
+            return outputs, extracted
 
-        # return outputs  # outputs, (hidden states), (attentions)
+        return outputs  # outputs, (hidden states), (attentions)
 
 
 class CaptionBertLayer(BertLayer):
@@ -319,7 +219,7 @@ class BertImgModel(BertPreTrainedModel):
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None,
             position_ids=None, head_mask=None, img_feats=None,
-            encoder_history_states=None, teacher_outputs=None, loss_align=None):
+            encoder_history_states=None, extract_layers=set()):
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
@@ -391,23 +291,21 @@ class BertImgModel(BertPreTrainedModel):
 
         encoder_outputs = self.encoder(embedding_output,
                 extended_attention_mask, head_mask=head_mask,
-                encoder_history_states=encoder_history_states,
-                teacher_outputs=teacher_outputs, loss_align=loss_align)
-        
-        # loss = None
-        # if isinstance(encoder_outputs, tuple):
-        (encoder_outputs, loss) = encoder_outputs
-        
+                encoder_history_states=encoder_history_states, extract_layers=extract_layers)
+
+        if len(extract_layers) > 0:
+            (encoder_outputs, extracted) = encoder_outputs
+
         sequence_output = encoder_outputs[0]
         pooled_output = self.pooler(sequence_output)
 
         # add hidden_states and attentions if they are here
         outputs = (sequence_output, pooled_output,) + encoder_outputs[1:]
-        
-        # if loss is not None:
-            # return outputs, loss
-        # return outputs
-        return outputs, loss
+
+        if len(extract_layers) > 0:
+            return outputs, extracted
+
+        return outputs
 
 
 def instance_bce_with_logits(logits, labels, reduction='mean'):
@@ -427,15 +325,13 @@ class ImageBertForSequenceClassification(BertPreTrainedModel):
         self.num_labels = config.num_labels
         self.loss_type = config.loss_type
         self.config = config
-        # self.is_teacher_model = config.is_teacher_model
+        self.is_teacher_model = config.is_teacher_model
         if config.img_feature_dim > 0:
             self.bert = BertImgModel(config)
         else:
             self.bert = BertModel(config)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-        # if self.is_teacher_model:
-        #     self.classifier = None
         if hasattr(config, 'classifier'):
             if not hasattr(config, 'cls_hidden_scale'): 
                 config.cls_hidden_scale = 2
@@ -457,36 +353,21 @@ class ImageBertForSequenceClassification(BertPreTrainedModel):
         self.bert.code_embeddings.weight.data = em.clone()
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None, 
-            position_ids=None, head_mask=None, img_feats=None, teacher_outputs=None, loss_align=None):
+            position_ids=None, head_mask=None, img_feats=None, teacher_outputs=None, extract_layers=set()):
         outputs = self.bert(input_ids, position_ids=position_ids, token_type_ids=token_type_ids,
-                            attention_mask=attention_mask, head_mask=head_mask, img_feats=img_feats,
-                            teacher_outputs=teacher_outputs, loss_align=loss_align)
+                            attention_mask=attention_mask, head_mask=head_mask, img_feats=img_feats, extract_layers=extract_layers)
 
-        # loss = 0
-        # if isinstance(outputs, tuple):
-        (outputs, loss) = outputs
-
-        if loss is None:
-            loss = 0
-
-        # if self.is_teacher_model:
-        #     return outputs[0]
-
-        # if teacher_outputs is not None:
-        #     kd_loss_fct = MSELoss()
-        #     teacher_outputs = teacher_outputs.to(torch.float)
-        #     kd_loss = kd_loss_fct(outputs[0].view(-1), teacher_outputs.view(-1))
+        if len(extract_layers) > 0:
+            (outputs, extracted) = outputs
 
         pooled_output = outputs[1]
         pooled_output = self.dropout(pooled_output)
         logits = self.classifier(pooled_output)
 
-        do_kd = teacher_outputs is not None
-
-        logits_loss_fn = CrossEntropyLoss()
-        if do_kd and 'logits' in teacher_outputs and LOGIT_LOSS:
-            # print(logits.shape, teacher_outputs['logits'].shape)
-            loss += instance_bce_with_logits(logits.to(torch.float), teacher_outputs['logits'].to(torch.float))
+        if 'logits' in extract_layers:
+            # extracted['logits'] = logits.cpu().data.numpy().astype(np.float16)
+            # extracted['logits'] = torch.from_numpy(extracted['logits'])
+            extracted['logits'] = logits.cpu().data.type(torch.HalfTensor)
 
         outputs = (logits,) + outputs[2:]  # add hidden states and attention if they are here
         if labels is not None:
@@ -503,12 +384,7 @@ class ImageBertForSequenceClassification(BertPreTrainedModel):
                     reshaped_logits = log_softmax(reshaped_logits)
                     loss = loss_fct(reshaped_logits, labels.contiguous())
                 elif self.loss_type == 'bce': # [VQA]
-                    # TODO: Refactor
-                    if do_kd:
-                        loss += 0 * instance_bce_with_logits(logits, labels)
-                    else:
-                        loss += instance_bce_with_logits(logits, labels)
-
+                    loss = instance_bce_with_logits(logits, labels)
                 else: # cross_entropy [GQA, Retrieval, Captioning]
                     loss_fct = CrossEntropyLoss()
                     loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
@@ -516,7 +392,11 @@ class ImageBertForSequenceClassification(BertPreTrainedModel):
             #     outputs = (kd_loss + loss,) + outputs
             # else:
             outputs = (loss,) + outputs
+        if len(extract_layers) > 0:
+            return outputs, extracted
+
         return outputs
+
 
 class ImageBertForMultipleChoice(BertPreTrainedModel):
     """

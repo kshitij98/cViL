@@ -8,6 +8,7 @@ import logging
 import os
 import copy, time, json
 import base64
+from tqdm import tqdm
 
 import sys
 sys.path.insert(0, '.')
@@ -18,8 +19,9 @@ import torch.nn as nn
 from torch.utils.data import (Dataset, DataLoader, RandomSampler, SequentialSampler, TensorDataset)
 from torch.utils.data.distributed import DistributedSampler
 import _pickle as cPickle
+import threading
 
-from oscar.modeling.modeling_bert import ImageBertForSequenceClassification
+from oscar.modeling.modeling_bert_features import ImageBertForSequenceClassification
 from transformers.pytorch_transformers import WEIGHTS_NAME, BertTokenizer, BertConfig
 from transformers.pytorch_transformers import AdamW, WarmupLinearSchedule, WarmupConstantSchedule
 
@@ -37,6 +39,27 @@ MODEL_CLASSES = {
 log_json = []
 debug_size = 500
 
+def save_tensor(tensors, batch_tokens, names, token_names, worker_id, total_workers):
+    total = len(tensors)
+    sz = total // total_workers
+    start_id = worker_id * sz
+
+    for idx in range(start_id, min(total, start_id + sz)):
+        torch.save(tensors[idx], names[idx])
+        torch.save(batch_tokens[idx], token_names[idx])
+
+
+class ImageFeatureLoader:
+    def __init__(self, dir_name, file_format):
+        self.dir_name = dir_name
+        self.file_format = file_format
+
+    def __getitem__(self, key):
+        name = f'{self.dir_name}/{key}.{self.file_format}'
+        return torch.load(name)
+
+    def __len__(self):
+        return len(os.listdir(self.dir_name))
 
 def _load_dataset(args, name):
     processor = processors[args.task_name]()
@@ -82,20 +105,29 @@ def _load_dataset(args, name):
 class VQADataset(Dataset):
     """ VQA Dataset """
 
-    def __init__(self, args, name, tokenizer):
+    def __init__(self, args, name, tokenizer, teacher=None):
         super(VQADataset, self).__init__()
         assert name in ['train', 'val', 'test-dev2015', 'test2015', 'train+val']
 
         self.args = args
         self.name = name
+        self.teacher_model = None
+        if teacher is not None:
+            # TODO: Shift teacher model to GPU, currently testing on CPU
+            self.teacher_data_loader = VQADataset(args, name, teacher[0])
+            self.teacher_model = teacher[1]
+            # print(f'Shifting teacher model to {device}!')
+            # self.teacher_model.to(device)
 
         # load image features
         t_start = time.time()
         self.img_feature_file = None
         self.img_feat_offset_map = None
 
+        print(f'Loading image features for {name}...')
+
         if args.img_feature_type == 'faster_r-cnn':
-            if args.img_feat_format == 'pt':
+            if args.img_feat_format == 'pt-split':
                 if args.img_feature_dim == 2048: # object features
                     self.img_features = torch.load(os.path.join(args.data_dir, '{}_img_frcnn_obj_feats.pt'.format(name)))
                 else: # object + spatial features
@@ -103,6 +135,14 @@ class VQADataset(Dataset):
                         self.img_features = torch.load(os.path.join(args.data_dir, 'train+val_img_frcnn_feats.pt'))
                     else:
                         self.img_features = torch.load(os.path.join(args.data_dir, '{}_img_frcnn_feats.pt'.format(name)))
+            elif args.img_feat_format == 'pt':
+                if args.img_feature_dim == 2048: # object features
+                    self.img_features = ImageFeatureLoader(os.path.join(args.data_dir, name), 'pt')
+                else: # object + spatial features
+                    if args.use_vg_dev:
+                        self.img_features = ImageFeatureLoader(os.path.join(args.data_dir, 'train+val'), 'pt')
+                    else:
+                        self.img_features = ImageFeatureLoader(os.path.join(args.data_dir, name), 'pt')
             elif args.img_feat_format == 'tsv':
                 self.load_img_tsv_features()
         elif args.img_feature_type == 'mask_r-cnn':
@@ -111,6 +151,7 @@ class VQADataset(Dataset):
             self.img_features = torch.load(os.path.join(args.data_dir, 'vqvae', '{}.pt'.format(name)))['feats_{}'.format(args.code_level)]
         else:
             self.img_features = torch.load(os.path.join(args.data_dir, '{}_img_feats.pt'.format(name)))
+        print('Loaded image features!')
         t_end = time.time()
         logger.info('Info: loading {0} features using {1:.2f} secs'.format(name, (t_end-t_start)))
 
@@ -147,7 +188,7 @@ class VQADataset(Dataset):
             if len(example.label) == 0: continue
             if ex_index % 10000 == 0: logger.info("Tensorizing example %d of %d" % (ex_index, len(self.examples)))
 
-            tokens_a = self.tokenizer.tokenize(example.text_a)
+            tokens_a = self.tokenizer.tokenize(example.text_a[self.args.lang])
 
             tokens_b = None
             if example.text_b:
@@ -244,9 +285,9 @@ class VQADataset(Dataset):
                     cls_token='[CLS]', sep_token='[SEP]', pad_token=0,
                     sequence_a_segment_id=0, sequence_b_segment_id=1,
                     cls_token_segment_id=1, pad_token_segment_id=0,
-                    mask_padding_with_zero=True):
+                    mask_padding_with_zero=True, question_id=None):
 
-        tokens_a = self.tokenizer.tokenize(example.text_a)
+        tokens_a = self.tokenizer.tokenize(example.text_a[self.args.lang])
 
         tokens_b = None
         if example.text_b:
@@ -353,27 +394,59 @@ class VQADataset(Dataset):
             #img_feat = img_feat.reshape(-1, img_feat.shape[0])
             img_feat = img_feat.type(torch.float)
 
+
         return (torch.tensor(input_ids, dtype=torch.long),
                 torch.tensor(input_mask, dtype=torch.long),
                 torch.tensor(segment_ids, dtype=torch.long),
                 torch.tensor([label_id[0]], dtype=torch.long),
                 torch.tensor(new_scores, dtype=torch.float),
                 img_feat,
-                torch.tensor([example.q_id], dtype=torch.long))
+                torch.tensor([example.q_id], dtype=torch.long),
+                torch.tensor([question_id], dtype=torch.long)), tokens, example.img_key
 
     def __getitem__(self, index):
+        # print(self.teacher_model)
+        if self.teacher_model is not None:
+            # teacher_example = self.teacher_data_loader[index]
+
+            # input = {'input_ids':      teacher_example[0],
+            #          'attention_mask': teacher_example[1],
+            #          'token_type_ids': teacher_example[2] if self.args.model_type in ['bert', 'xlnet'] else None,  # XLM don't use segment_ids
+            #          'labels':         teacher_example[4],
+            #          'img_feats':      None if self.args.img_feature_dim == -1 else teacher_example[5]}
+
+            # for key in input:
+            #     input[key] = input[key].unsqueeze(dim=0)
+            #     # input[key].to(self.args.device)
+            #     # print(f'{key} device = {input[key].device}')
+
+            # # print(f'Loaded {input} for training!')
+            # # input = input.unsqueeze()
+            # # print(f'teacher model device = {self.teacher_model.device}')
+            # teacher_outputs = self.teacher_model(**input)
+            # print(f'Loaded {teacher_outputs.shape} for loss!')
+
+            teacher_outputs = torch.zeros((1, 178, 768))
         if self.args.load_fast:
             example = self.features[index]
         else:
             entry = self.examples[index]
-            example = self.tensorize_example(entry,
+            example, tokens, img_id = self.tensorize_example(entry,
                 cls_token_at_end=bool(self.args.model_type in ['xlnet']), # xlnet has a cls token at the end
                 cls_token=self.tokenizer.cls_token,
                 sep_token=self.tokenizer.sep_token,
                 cls_token_segment_id=2 if self.args.model_type in ['xlnet'] else 0,
                 pad_on_left=bool(self.args.model_type in ['xlnet']), # pad on the left for xlnet
-                pad_token_segment_id=4 if self.args.model_type in ['xlnet'] else 0)
-        return example
+                pad_token_segment_id=4 if self.args.model_type in ['xlnet'] else 0,
+                question_id=index)
+        # example.append(teacher_outputs[1])
+
+        tokens = '<SPLIT>'.join(tokens)
+
+        if self.teacher_model is not None:
+                return (example, teacher_outputs[0, ...]), tokens, img_id
+                # print('E', example, example[-1].shape)
+        return example, tokens, img_id
 
     def __len__(self):
         return len(self.examples)
@@ -458,6 +531,9 @@ def trim_batch(batch):
 def train(args, train_dataset, eval_dataset, model, tokenizer):
     """ Train the model """
     #if args.local_rank in [-1, 0]: tb_writer = SummaryWriter()
+
+    model.eval()
+    model.requires_grad = False
 
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
     train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
@@ -551,18 +627,23 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
         #global_step = epoch*math.ceil(len(train_dataset)/(args.train_batch_size * args.gradient_accumulation_steps * (torch.distributed.get_world_size() if args.local_rank != -1 else 1)))
 
         t_start = time.time()
-        for step, batch in enumerate(train_dataloader):
-            model.train()
+        for step, batch in tqdm(enumerate(train_dataloader)):
+            (batch, ) = batch
+            # model.train()
+            model.eval()
             batch = tuple(t.to(args.device) for t in batch)
-            inputs = {'input_ids':      batch[0],
-                      'attention_mask': batch[1],
-                      'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,  # XLM don't use segment_ids
-                      'labels':         batch[4],
-                      'img_feats':      None if args.img_feature_dim == -1 else batch[5]}
+            inputs = {'input_ids':       batch[0],
+                      'attention_mask':  batch[1],
+                      'token_type_ids':  batch[2] if args.model_type in ['bert', 'xlnet'] else None,  # XLM don't use segment_ids
+                      'labels':          batch[4],
+                      'img_feats':       None if args.img_feature_dim == -1 else batch[5]}
+                    #   'img_feats':       None if args.img_feature_dim == -1 else batch[5],
+                    #   'teacher_outputs': teacher_outputs}
             outputs = model(**inputs)
 
             #loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
             loss, logits = outputs[:2]
+            # print(loss.shape, logits.shape)
 
             #loss = instance_bce_with_logits(logits, batch[4])
 
@@ -679,12 +760,34 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
     return global_step, tr_loss / global_step
 
 
-def evaluate(args, model, eval_dataset=None, prefix=""):
+def evaluate(args, model, eval_dataset=None, prefix="", extract_layers=set()):
     # Loop to handle MNLI double evaluation (matched, mis-matched)
     eval_task_names = ("mnli", "mnli-mm") if args.task_name == "mnli" else (args.task_name,)
     eval_outputs_dirs = (args.output_dir, args.output_dir + '-MM') if args.task_name == "mnli" else (args.output_dir,)
 
     #if args.n_gpu > 1: model = torch.nn.DataParallel(model) # debug: single-gpu or multi-gpus
+
+    image_label_file = f'{args.txt_data_dir}/image_labels.tsv'
+    image_labels = {}
+    i = 0
+    print('Loading image labels...')
+    with open(image_label_file) as f:
+        while True:
+            line = f.readline()
+            if not line:
+                break
+
+            img_id, features = line.split('\t')
+            features = json.loads(features)
+            # print(features.keys())
+            object_labels = [x['class'] for x in features['objects']]
+
+            image_labels[img_id] = object_labels
+
+            i += 1
+            if i % 1000 == 0:
+                print(i)
+
 
     results = []
     t_start = time.time()
@@ -709,18 +812,112 @@ def evaluate(args, model, eval_dataset=None, prefix=""):
         upper_bound = 0
         results_dict = {}
 
-        for batch in eval_dataloader:
+
+
+        for batch in tqdm(eval_dataloader):
         #for batch in tqdm(eval_dataloader, desc="Evaluating"):
             model.eval()
+
+            batch, tokens, img_ids = batch
+
+            # print(img_ids.shape)
+
+            tokens = [x.split('<SPLIT>') for x in tokens]
+            # print(len(tokens))
+            # print(tokens[0])
+            # print(tokens[0])
+            # break
             batch = tuple(t.to(args.device) for t in batch)
+
+            USER = os.environ['USER']
+            q_ids = batch[7]
+            stored = True
+            for id in q_ids:
+                name = f'{args.teacher_features_dir}/features/{id.item()}.pt'
+                if not os.path.exists(name):
+                    stored = False
+            
+            if stored:
+                continue
 
             with torch.no_grad():
                 inputs = {'input_ids':      batch[0],
                           'attention_mask': batch[1],
                           'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,  # XLM don't use segment_ids
                           'labels':         batch[4],
-                          'img_feats':      None if args.img_feature_dim == -1 else batch[5]}
+                          'img_feats':      None if args.img_feature_dim == -1 else batch[5],
+                          'extract_layers': extract_layers}
                 outputs = model(**inputs)
+
+                if len(extract_layers) > 0:
+                    (outputs, extracted) = outputs
+                    q_ids = batch[7]
+
+                    batch_data = []
+                    batch_tokens = []
+                    names = []
+                    token_names = []
+                    for i, id in enumerate(q_ids):
+                        data = {}
+                        n_tokens = len(batch[0][i])
+                        used_tokens = n_tokens
+                        for idx in range(n_tokens):
+                            if batch[0][i][n_tokens - 1 - idx] != 0:
+                                used_tokens = n_tokens - idx
+                                break
+                        
+                        for (k, v) in extracted.items():
+                            x = v[i]
+                            if k != 'logits':
+                                x = torch.cat((x[:used_tokens], x[-50:]), dim=0)
+                            data[k] = x.clone()
+
+                        # print(len(tokens))
+                        # assert i < len(tokens), (i, len(tokens))
+                        # assert used_tokens == min(used_tokens, len(tokens[i])), (i, len(tokens))
+
+                        img_id = str(img_ids[i].item())
+
+                        assert used_tokens == min(used_tokens, len(tokens[i])), (used_tokens, len(tokens[i]))
+                        assert img_id in image_labels, img_id
+
+                        image_tokens = image_labels[img_id]
+                        if len(image_tokens) > 50:
+                            image_tokens = image_tokens[:50]
+                        if len(image_tokens) < 50:
+                            image_tokens = image_tokens + [''] * (50 - len(image_tokens))
+
+                        if len(tokens[i]) > used_tokens:
+                            tokens[i] = tokens[i][:used_tokens]
+                        
+                        batch_token = tokens[i] + image_tokens
+                        batch_tokens.append(batch_token)
+                        batch_data.append(data)
+
+                        data_len = len(data['encoder11'])
+                        assert data_len == len(batch_token), (data_len, len(batch_token))
+
+                        # TODO: Save tokens as well!
+                        
+
+                        name = f'{args.teacher_features_dir}/features/{id.item()}.pt'
+                        token_name = f'{args.teacher_features_dir}/tokens/{id.item()}.pt'
+                        names.append(name)
+                        token_names.append(token_name)
+
+                    # print('Saving ', len(batch_data), 'samples')
+
+                    n_threads = 16
+                    threads = []
+                    for thread_id in range(n_threads):
+                        threads.append(threading.Thread(target=save_tensor, args=(batch_data, batch_tokens, names, token_names, thread_id, n_threads)))
+
+                    for thread in threads:
+                        thread.start()
+
+                    for thread in threads:
+                        thread.join()
+
                 tmp_eval_loss, logits = outputs[:2]
 
                 eval_loss += tmp_eval_loss.mean().item()
@@ -927,6 +1124,8 @@ def main():
                         help="The input data dir. Should contain the .tsv files (or other data files) for the task.")
     parser.add_argument("--txt_data_dir", default=None, type=str, required=True,
                         help="The input text data dir. Should contain the .json files (or other data files) for the task.")
+    parser.add_argument("--lang", default=None, type=str, required=False,
+                        help="The language to use for knowledge extraction.")
 
     parser.add_argument("--model_type", default=None, type=str, required=True,
                         help="Model type selected in the list: " + ", ".join(MODEL_CLASSES.keys()))
@@ -934,6 +1133,8 @@ def main():
                         help="Path to pre-trained model or shortcut name")
     parser.add_argument("--task_name", default=None, type=str, required=True,
                         help="The name of the task to train selected in the list: " + ", ".join(processors.keys()))
+    parser.add_argument("--teacher_features_dir", default=None, type=str, required=True,
+                        help="Path to the features extracted by the teacher model")
     parser.add_argument("--output_dir", default=None, type=str, required=True,
                         help="The output directory where the model predictions and checkpoints will be written.")
     parser.add_argument("--label_file", type=str, default=None, help="Label Dictionary")
@@ -1014,6 +1215,8 @@ def main():
     parser.add_argument("--load_fast", action='store_true', help="Load Tensor Fast")
     parser.add_argument('-j', '--workers', default=0, type=int, metavar='N', help='number of data loading workers (default: 4)')
 
+    parser.add_argument('--layers', '-l', nargs='+', default=[], help='The list of layers to extract features from', required=True)
+
     #args = '--data_dir ../vqa/ban-vqa/data/qal_pairs --model_type bert --model_name_or_path bert-base-uncased --task_name vqa_text ' \
     #       '--do_train --do_eval --do_lower_case --max_seq_length 40 --per_gpu_eval_batch_size 16 --per_gpu_train_batch_size 16 --learning_rate 2e-5 ' \
     #       '--num_train_epochs 20.0 --output_dir ./results/vqa_text --label_file ../vqa/ban-vqa/data/cache/trainval_ans2label.pkl ' \
@@ -1027,6 +1230,31 @@ def main():
     #args = parser.parse_args(args.split())
 
     args = parser.parse_args()
+
+    print('Extracting features from these layers:')
+    print(args.layers)
+    layers = set([x.strip() for x in args.layers if x.strip() != ''])
+
+    USER = os.environ['USER']
+    cached_features_metadata = f'{args.teacher_features_dir}/layers.txt'
+    if os.path.exists(cached_features_metadata):
+        cached_layers = set()
+        with open(cached_features_metadata, 'r') as f:
+            cached_layers = f.readlines()
+        cached_layers = set([x.strip() for x in cached_layers if x.strip() != ''])
+        print(cached_layers)
+
+        if layers.issubset(cached_layers):
+            print('Features are already cached!')
+            exit(0)
+        print('Need to extract features from these layers:')
+        print(layers.difference(cached_layers))
+        os.remove(cached_features_metadata)
+    else:
+        print('Features not found!')
+
+    os.makedirs(f'{args.teacher_features_dir}/features', exist_ok=True)
+    os.makedirs(f'{args.teacher_features_dir}/tokens', exist_ok=True)
 
     if args.philly:  # use philly
         logger.info('Info: Use Philly, all the output folders are reset.')
@@ -1083,10 +1311,13 @@ def main():
 
     args.model_type = args.model_type.lower()
     config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
+    assert(args.config_name is "")
     config = config_class.from_pretrained(
         args.config_name if args.config_name else args.model_name_or_path,
         num_labels=num_labels, finetuning_task=args.task_name,
     )
+
+    assert(args.tokenizer_name is "")
     tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, do_lower_case=args.do_lower_case)
 
     # discrete code
@@ -1098,7 +1329,7 @@ def main():
     config.classifier = args.classifier
     config.cls_hidden_scale = args.cls_hidden_scale
     #config.use_img_layernorm = args.use_img_layernorm
-    
+    config.is_teacher_model = False
     # load discrete code
     if args.img_feature_type in ['dis_code', 'dis_code_t']:
         logger.info('Load discrete code from: {}'.format(args.data_dir))
@@ -1127,7 +1358,7 @@ def main():
     if args.local_rank == 0:
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
 
-    print(model)
+    # print(model)
 
     model.to(args.device)
 
@@ -1144,8 +1375,10 @@ def main():
 
     # Training
     if args.do_train:
-        #train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
+        # train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
+        # train_dataset = VQADataset(args, 'train', tokenizer, (teacher_tokenizer, teacher_model))
         train_dataset = VQADataset(args, 'train', tokenizer)
+        print('Training set ready!')
         global_step, tr_loss = train(args, train_dataset, eval_dataset, model, tokenizer)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
@@ -1188,10 +1421,12 @@ def main():
         for checkpoint in checkpoints:
             global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
             print(checkpoint)
-            model = model_class.from_pretrained(checkpoint, config=config)
+            # model = model_class.from_pretrained(checkpoint, config=config)
             print('model = ', model)
-            model.to(args.device)
-            result, score, upper_bound = evaluate(args, model, eval_dataset, prefix=global_step)
+            # model.to(args.device)
+            train_dataset = VQADataset(args, 'train', tokenizer)
+            # result, score, upper_bound = evaluate(args, model, eval_dataset, prefix=global_step, extract_layers=layers)
+            result, score, upper_bound = evaluate(args, model, train_dataset, prefix=global_step, extract_layers=layers)
             #result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
             #results.update(result)
 

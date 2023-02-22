@@ -20,7 +20,6 @@ import os
 
 logger = logging.getLogger(__name__)
 
-NUM_LABELS = int(os.environ['NUM_LABELS'])
 LOGIT_LOSS = False
 
 class CaptionBertSelfAttention(BertSelfAttention):
@@ -100,21 +99,12 @@ class CaptionBertEncoder(BertEncoder):
         self.output_hidden_states = config.output_hidden_states
         self.layer = nn.ModuleList([CaptionBertLayer(config) for _ in range(config.num_hidden_layers)])
         self.USER = os.environ['USER']
-        self.SSD = os.environ['SSD']
-
-        self.FINAL_LAYER_ONLY = False
-        if 'FINAL_LAYER_ONLY' in os.environ.keys() and os.environ['FINAL_LAYER_ONLY'] == '1':
-            self.FINAL_LAYER_ONLY = True
-
-        if self.SSD == '1':
-            self.feature_dir = f'/ssd_scratch/cvit/{self.USER}/features'
-            if self.USER == 'devanshg27':
-                self.feature_dir = f'/ssd_scratch/users/devanshg27/features'                
-        else:
-            self.feature_dir = f'/scratch/{self.USER}/datasets/oscar/vqa/features'
+        # self.feature_dir = f'/scratch/{self.USER}/datasets/oscar/vqa/features/teacher'
         # MANUAL: Need to update manually hardcoded for now! TODO!
-        # self.feature_dir = f'/ssd_scratch/cvit/{self.USER}/features'
+        self.feature_dir = f'/ssd_scratch/cvit/{self.USER}/features'
 
+    # TODO(Kshitij): Compute loss on [CLS] token after every layer!
+    # TODO(Kshitij): Can pass an added parameter and break from the loop on time!
     def forward(self, hidden_states, attention_mask, head_mask=None,
                 encoder_history_states=None, teacher_outputs=None, loss_align=None):
         all_hidden_states = ()
@@ -126,11 +116,6 @@ class CaptionBertEncoder(BertEncoder):
 
         # print(hidden_states.shape)
         if do_kd:
-            align, loss_bools = loss_align
-            align = align.type(torch.long)
-
-            # print(align)
-
             teacher_feats = []
             for i, x in enumerate(teacher_outputs):
                 x = torch.load(f'{self.feature_dir}/{x.item()}.pt', map_location=lambda storage, loc: storage.cuda(device))
@@ -140,13 +125,6 @@ class CaptionBertEncoder(BertEncoder):
                     # print(x[k].shape)
                     gap = torch.zeros((hidden_states.shape[1] - x[k].shape[0], hidden_states.shape[2]), device=f'cuda:{device}')
                     x[k] = torch.cat((x[k][:-50, :], gap, x[k][-50:, :]), dim=0)
-                    # if k == 'encoder11' and i == 0 and device == 0:
-                    #     print('B', x[k][0, :5])
-                    #     print('B', x[k][1, :5])
-                    x[k] = x[k][align[i]]
-                    # if k == 'encoder11' and i == 0 and device == 0:
-                    #     print('A', x[k][0, :5])
-                    #     print('A', x[k][1, :5])
                     # print(x[k].shape)
 
                 teacher_feats.append(x)
@@ -156,13 +134,15 @@ class CaptionBertEncoder(BertEncoder):
                     continue
                 teacher_outputs[k] = []
 
+            align, loss_bools = loss_align
+            align = align.type(torch.long)
             for k in teacher_feats[0].keys():
                 if k == 'logits':
                     continue
                 for x in teacher_feats:
                     teacher_outputs[k].append(x[k])
                 teacher_outputs[k] = torch.stack(teacher_outputs[k], dim=0)
-                # teacher_outputs[k] = teacher_outputs[k][align]
+                teacher_outputs[k] = teacher_outputs[k][align]
 
             # print(loss_align)
 
@@ -188,23 +168,16 @@ class CaptionBertEncoder(BertEncoder):
 
             encoder_kd = do_kd and (f'encoder{teacher_i}' in teacher_outputs)
 
-            if do_kd and encoder_kd and (not self.FINAL_LAYER_ONLY or teacher_i == 11):
+            if do_kd and encoder_kd:
                 # Apply loss on object tags and code-mixed language
                 # pass
 
-                # temp_bools = loss_bools
-                # print('>', temp_bools.shape)
-
                 curr_loss = encoder_loss_fn(teacher_outputs[f'encoder{teacher_i}'][loss_bools], hidden_states[loss_bools])
-
-                # if teacher_i == 11:
-                    # curr_loss = curr_loss
-
                 if loss is None:
                     loss = curr_loss
                 else:
                     loss = loss + curr_loss
-                # pass
+                pass
 
             # if do_kd and (encoder_kd or f'image{teacher_i}' in teacher_outputs):
             #     # Calculating image token loss, add added support from another layer name
@@ -499,16 +472,11 @@ class ImageBertForSequenceClassification(BertPreTrainedModel):
                     # KL Loss: https://github.com/uclanlp/visualbert/blob/master/pytorch_pretrained_bert/modeling.py
                     loss_fct = torch.nn.KLDivLoss(reduction="batchmean")
                     log_softmax = torch.nn.LogSoftmax(dim=-1)
-                    reshaped_logits = logits.contiguous().view(-1, NUM_LABELS)
+                    reshaped_logits = logits.contiguous().view(-1, 3129)
                     reshaped_logits = log_softmax(reshaped_logits)
                     loss = loss_fct(reshaped_logits, labels.contiguous())
                 elif self.loss_type == 'bce': # [VQA]
-                    # TODO: Refactor
-                    if do_kd:
-                        loss += 0 * instance_bce_with_logits(logits, labels)
-                    else:
-                        loss += instance_bce_with_logits(logits, labels)
-
+                    loss += instance_bce_with_logits(logits, labels)
                 else: # cross_entropy [GQA, Retrieval, Captioning]
                     loss_fct = CrossEntropyLoss()
                     loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
@@ -1129,56 +1097,4 @@ class BertImgForPreTraining(ImgPreTrainedModel):
     """
     config_class = BertConfig
     pretrained_model_archive_map = BERT_PRETRAINED_MODEL_ARCHIVE_MAP
-    load_tf_weights = load_tf_weights_in_bert
-    base_model_prefix = "bert"
-
-    def __init__(self, config):
-        super(BertImgForPreTraining, self).__init__(config)
-
-        #self.bert = BertModel(config) # original BERT
-        self.bert = BertImgModel(config)
-        self.cls = BertPreTrainingHeads(config)
-        self.num_seq_relations = config.num_contrast_classes if hasattr(config, "num_contrast_classes") else 2
-
-        self.apply(self.init_weights)
-        self.tie_weights()
-
-    def init_weights(self, module):
-        """ Initialize the weights.
-        """
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
-            module.weight.data.normal_(mean=0.0,
-                                       std=self.config.initializer_range)
-        elif isinstance(module, BertLayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
-        if isinstance(module, nn.Linear) and module.bias is not None:
-            module.bias.data.zero_()
-
-    def tie_weights(self):
-        """ Make sure we are sharing the input and output embeddings.
-            Export to TorchScript can't handle parameter sharing so we are cloning them instead.
-        """
-        self._tie_or_clone_weights(self.cls.predictions.decoder,
-                                   self.bert.embeddings.word_embeddings)
-
-    def forward(self, input_ids, token_type_ids=None, attention_mask=None, masked_lm_labels=None,
-            next_sentence_label=None, position_ids=None, head_mask=None, img_feats=None):
-        outputs = self.bert(input_ids, position_ids=position_ids, token_type_ids=token_type_ids,
-                            attention_mask=attention_mask, head_mask=head_mask, img_feats=img_feats)
-
-        sequence_output, pooled_output = outputs[:2]
-        prediction_scores, seq_relationship_score = self.cls(sequence_output, pooled_output)
-
-        outputs = (prediction_scores, seq_relationship_score,) + outputs[2:]  # add hidden states and attention if they are here
-
-        if masked_lm_labels is not None and next_sentence_label is not None:
-            loss_fct = CrossEntropyLoss(ignore_index=-1)
-            masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), masked_lm_labels.view(-1))
-            next_sentence_loss = loss_fct(seq_relationship_score.view(-1, self.num_seq_relations), next_sentence_label.view(-1))
-            total_loss = masked_lm_loss + next_sentence_loss
-            outputs = (total_loss,) + outputs + (masked_lm_loss,)
-
-        return outputs  # (loss), prediction_scores, seq_relationship_score, (hidden_states), (attentions)
+    load_tf_weight                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         
