@@ -477,21 +477,6 @@ class VQADataset(Dataset):
                 en_token_dict[word] = False    
             en_token_dict[word] = (i, pos - i + 1)
 
-            # # print('ET>', token)
-            # word = token
-            # pos = i + 1
-            # while pos < len(en_bert_tokens):
-            #     if not en_bert_tokens[pos].startswith('##'):
-            #         break
-            #     word += en_bert_tokens[pos]
-            #     pos += 1
-            
-
-            # if token not in en_token_dict:
-            #     en_token_dict[token] = [i]
-            # else:
-            #     en_token_dict[token].append(i)
-
         words = []
         for i, token in enumerate(codemix_bert_tokens):
             if token.startswith('##'):
@@ -514,72 +499,7 @@ class VQADataset(Dataset):
                     loss_align[i + id + 1] = aligned_i + id + 1 # CLS TOKEN is 0th token
                     loss_bools[i + id + 1] = True
 
-                # assert word in en_token_dict, f'{word}'
-            # en_token_dict[word] = (i, pos - i + 1)
-
-        # loss_bools[0] = True
-        # loss_align[0] = 0
-
-        # print(loss_align[:20])
-
-        # print(loss_align, loss_bools)
-            # # print('CT>', token)
-            # if token in en_token_dict:
-            #     loss_align[i] = en_token_dict[token][0]
-            #     loss_bools[i] = True
-            #     assert len(en_token_dict[token]) == 1
-            # # else:
-            #     # en_token_dict[token].append(i)
         return loss_align, loss_bools
-
-
-
-        # cm_id = 0
-        # en_id = 0
-
-
-
-        # print(aligns)
-
-        # bert_sent = ''
-        # for x in codemix_bert_tokens:
-        #     if x.startswith('##'):
-        #         bert_sent += x[2:]
-        #     else:
-        #         bert_sent += f'{x}'
-
-        # bert_sent = bert_sent.strip()
-
-        # processed = ''
-        # matches = 0
-        # for (ja_word_id, align) in aligns:
-
-        #     while cm_id < len(codemix_bert_tokens):
-        #         cm_token = codemix_bert_tokens[cm_id]
-        #         cm_id += 1
-        #         if cm_token.startswith('##'):
-        #             continue
-        #         if align[1].startswith(cm_token) or cm_token.startswith(align[1]):
-        #             print(cm_id, cm_token)
-                    
-        #             for i, token in enumerate(en_bert_tokens):
-        #                 if token == cm_token:
-        #                     loss_align[cm_id] = i
-        #                     loss_bools[cm_id] = True
-        #                     pos = i + 1
-        #                     matches += 1
-        #                     while pos < len(en_bert_tokens):
-        #                         if not token.startswith('##'):
-        #                             break
-        #                         loss_align[cm_id + 1] = pos
-        #                         loss_bools[cm_id + 1] = True
-        #                     break
-
-        # assert matches == len(aligns)
-
-        # # assert processed == bert_sent, f'{processed} ||| {bert_sent}'            
-
-        # return loss_align, loss_bools
 
     def tensorize_example(self, example, cls_token_at_end=False, pad_on_left=False,
                     cls_token='[CLS]', sep_token='[SEP]', pad_token=0,
@@ -662,18 +582,6 @@ class VQADataset(Dataset):
             loss_align_t[:len(tokens_a) + 1] = loss_align
             loss_bools_t = torch.zeros((178), dtype=torch.bool)
             loss_bools_t[:len(tokens_a) + 1] = loss_bools
-
-            # for token in tokens_a:
-                # print(token)
-            # print('\n')
-
-            # for token in 
-        # print(codemix)
-
-
-        # for word in word_align:
-            # print(word[0], end=' ')
-        # print('\n')
 
         if example.text_b:
             tokens_b = self.tokenizer.tokenize(example.text_b)
@@ -828,29 +736,6 @@ class VQADataset(Dataset):
         return tokens
 
     def __getitem__(self, index):
-        # print(self.teacher_model)
-        # if self.teacher_model is not None:
-            # teacher_example = self.teacher_data_loader[index]
-
-            # input = {'input_ids':      teacher_example[0],
-            #          'attention_mask': teacher_example[1],
-            #          'token_type_ids': teacher_example[2] if self.args.model_type in ['bert', 'xlnet'] else None,  # XLM don't use segment_ids
-            #          'labels':         teacher_example[4],
-            #          'img_feats':      None if self.args.img_feature_dim == -1 else teacher_example[5]}
-
-            # for key in input:
-            #     input[key] = input[key].unsqueeze(dim=0)
-            #     # input[key].to(self.args.device)
-            #     # print(f'{key} device = {input[key].device}')
-
-            # # print(f'Loaded {input} for training!')
-            # # input = input.unsqueeze()
-            # # print(f'teacher model device = {self.teacher_model.device}')
-            # teacher_outputs = self.teacher_model(**input)
-            # print(f'Loaded {teacher_outputs.shape} for loss!')
-
-            # teacher_outputs = torch.zeros((1, 178, 768))
-
         if self.args.load_fast:
             # print('Loading fast...')
             example = self.features[index]
@@ -865,52 +750,18 @@ class VQADataset(Dataset):
                 pad_on_left=bool(self.args.model_type in ['xlnet']), # pad on the left for xlnet
                 pad_token_segment_id=4 if self.args.model_type in ['xlnet'] else 0)
                 # teacher_features=self.teacher_features[index] if self.name == 'train' else None)
-        # example.append(teacher_outputs[1])
-        # if self.teacher_model is not None:
-                # return (example, teacher_outputs[0, ...])
-                # print('E', example, example[-1].shape)
         
         if self.args.do_kd and self.name == 'train':
-            # teacher_features = self.teacher_features[index]
-            # to_remove = [x for x in teacher_features.keys() if x not in self.args.layers]
-            # for k in to_remove:
-                # del teacher_features[k]
-
-            # return example, teacher_features
             en_tokens = self.get_tokens(index, self.teacher_tokenizer, language='en')
-            # hi_tokens = self.get_tokens(index, self.tokenizer, language=self.args.lang)
-
-            # print(len(en_tokens), len(hi_tokens))
-
-            # if 'word_align' in example.keys():
-                # print(example.word_align)
-
-            # en_tokens = tuple(en_tokens)
-            # hi_tokens = tuple(hi_tokens)
 
             hi_tokens = '<SPLIT>'.join(hi_tokens)
             en_tokens = '<SPLIT>'.join(en_tokens)
 
             tokens = [hi_tokens, en_tokens]
 
-            # for i, word in enumerate(word_align):
-            #     word = [str(x) for x in word]
-            #     word_align[i] = '~!~'.join(word)
-
-            # word_align = '~%~'.join(word_align)
-
-            # print(codemix_align)
-
             if codemix_align[0] is None:
                 return example, index, tokens
             return example, index, tokens, codemix_align
-        # elif self.name == 'train':
-            # teacher_features = self.teacher_features[index]
-            # to_remove = [x for x in teacher_features.keys() if x not in self.args.layers]
-            # for k in to_remove:
-                # del teacher_features[k]
-
-            # return example
         return example
 
     def __len__(self):
@@ -1117,24 +968,9 @@ def train(args, train_dataset, eval_dataset, model, tokenizer, teacher_tokenizer
                     if cm_align is not None:
                         cm_align.to(args.device)
                         cm_bools.to(args.device)
-                # codemix_align.to(args.device)
-
-                # print(len(codemix_align))
-                # print('>>>', codemix_align[0].shape)
-                # teacher_outputs = [torch.tensor(x) for x in teacher_outputs]
-                # print(teacher_outputs)
-
-                # word_align = [x.split('~%~') for x in word_align]
-                # word_align = [[x.split('~!~') for x in word] for word in word_align]
-
-                # print(word_align)
 
                 hi_tokens = [tokenized.split('<SPLIT>') for tokenized in tokens[0]]
                 en_tokens = [tokenized.split('<SPLIT>') for tokenized in tokens[1]]
-
-
-                # print(hi_tokens[0])
-                # print(en_tokens[0])
 
                 aligns = []
                 bools = []
@@ -1146,7 +982,6 @@ def train(args, train_dataset, eval_dataset, model, tokenizer, teacher_tokenizer
                     else:
                         align, bool = get_align(en, hi, (None, None), no_tags=args.no_tags, no_images=args.no_images, no_cls=args.no_cls)
 
-                    # print(align, bool)
                     aligns.append(align)
                     bools.append(bool)
 
@@ -1154,35 +989,8 @@ def train(args, train_dataset, eval_dataset, model, tokenizer, teacher_tokenizer
                 bools = torch.stack(bools, dim=0)
 
                 loss_align = (aligns, bools)
-                # print(token_aligns[0])
-
-                # print(tokens[0][ :, 0])
-
-                # print(teacher_align[0])
 
                 teacher_outputs = torch.stack(teacher_outputs, dim=0)
-                # print(teacher_outputs)
-
-                # t_torch_start = time.time()
-
-                # # Loading threads
-
-                # workers = 16
-                # threads = []
-                # for worker in range(workers):
-                #     threads.append(threading.Thread(target=teacher_load, args=(teacher_outputs, worker, workers, args.device)))
-
-                # for thread in threads:
-                #     thread.start()
-
-                # for thread in threads:
-                #     thread.join()
-
-                # # for k in range(len(teacher_outputs)):
-                #     # teacher_outputs[k] = torch.load(teacher_outputs[k], map_location=torch.device(args.device))
-                # t_torch = time.time() - t_torch_start
-                # teacher_outputs = tuple(teacher_outputs)
-                # [v.to(args.device) for v in teacher_outputs.values()]
 
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
@@ -1423,13 +1231,6 @@ def evaluate(args, model, eval_dataset=None, prefix=""):
             if nb_eval_steps % 25 == 0:
                 print(512 * nb_eval_steps * 100 / len(eval_dataloader.dataset))
 
-            #if preds is None:
-            #    preds = logits.detach().cpu().numpy()
-            #    out_label_ids = inputs['labels'].detach().cpu().numpy()
-            #else:
-            #    preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
-            #    out_label_ids = np.append(out_label_ids, inputs['labels'].detach().cpu().numpy(), axis=0)
-
         score = score / len(eval_dataloader.dataset)
         upper_bound = upper_bound / len(eval_dataloader.dataset)
 
@@ -1444,21 +1245,6 @@ def evaluate(args, model, eval_dataset=None, prefix=""):
 
     t_end = time.time()
     logger.info('Eva Time Cost: %.3f' % (t_end - t_start))
-
-        #eval_loss = eval_loss / nb_eval_steps
-        #if args.output_mode == "classification":
-        #    preds = np.argmax(preds, axis=1)
-        #elif args.output_mode == "regression":
-        #    preds = np.squeeze(preds)
-        #result = compute_metrics(eval_task, preds, out_label_ids)
-        #results.update(result)
-
-        #output_eval_file = os.path.join(eval_output_dir, "eval_results.txt")
-        #with open(output_eval_file, "w") as writer:
-        #    logger.info("***** Eval results {} *****".format(prefix))
-        #    for key in sorted(result.keys()):
-        #        logger.info("  %s = %s", key, str(result[key]))
-        #        writer.write("%s = %s\n" % (key, str(result[key])))
 
     return results, score, upper_bound
 
