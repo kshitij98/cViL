@@ -144,3 +144,4 @@ core
 
 coco_caption/
 transformers/
+*.bak
